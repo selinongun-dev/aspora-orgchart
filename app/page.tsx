@@ -8,6 +8,7 @@ type Row = {
   "Work Email": string;
   "Manager Email": string;
   Team: string;
+  Pod?: string;  
   Location: string;
   "Photo URL": string;
 };
@@ -75,6 +76,7 @@ export default function ClientPage() {
         name: name || workEmail || "(no name)",
         email: workEmail,
         team: String(r.Team || "").trim(),
+        pod: (r.Pod || "").trim(), 
         location: String(r.Location || "").trim(),
         photoUrl:
           ensureHttps(r["Photo URL"] || "") ||
@@ -133,27 +135,69 @@ export default function ClientPage() {
 
           return `
             <div style="
-              width:320px;height:120px;background:#fff;border:1px solid rgba(0,0,0,0.12);
-              border-radius:16px;box-shadow:0 2px 10px rgba(0,0,0,0.06);
+              width:320px;height:128px;background:#fff;border:1px solid rgba(0,0,0,0.14);
+              border-radius:16px;box-shadow:0 4px 14px rgba(0,0,0,0.08);
               padding:12px;display:flex;gap:12px;align-items:center;
             ">
               ${img}
-              <div style="display:flex;flex-direction:column;gap:6px;min-width:0;">
-                <div style="font-weight:800;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+              <div style="display:flex;flex-direction:column;gap:7px;min-width:0;flex:1;">
+                
+                <!-- Name (daha büyük + daha koyu) -->
+                <div style="
+                  font-weight:900;font-size:16px;line-height:1.15;color:#111827;
+                  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+                ">
                   ${p.name}
                 </div>
-                <div style="font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
-                  ${p.team}
+
+                <!-- Team + Pod (badge) -->
+                <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
+                  ${p.team ? `
+                    <span style="
+                      font-size:12px;font-weight:800;color:#111827;
+                      background:#F3F4F6;border:1px solid rgba(0,0,0,0.08);
+                      padding:2px 8px;border-radius:999px;
+                      white-space:nowrap;max-width:220px;overflow:hidden;text-overflow:ellipsis;
+                    ">
+                      ${p.team}
+                    </span>
+                  ` : ""}
+
+                  ${p.pod ? `
+                    <span style="
+                      font-size:12px;font-weight:800;color:#1E3A8A;
+                      background:#EEF2FF;border:1px solid rgba(30,58,138,0.15);
+                      padding:2px 8px;border-radius:999px;
+                      white-space:nowrap;max-width:220px;overflow:hidden;text-overflow:ellipsis;
+                    ">
+                      ${p.pod}
+                    </span>
+                  ` : ""}
                 </div>
-                <div style="font-size:11px;opacity:0.75;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
-                  ${p.location}
-                </div>
-                <div style="font-size:11px;opacity:0.7;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
-                  ${p.email}
-                </div>
+
+                <!-- Location -->
+                ${p.location ? `
+                  <div style="
+                    font-size:12px;font-weight:700;color:#374151;
+                    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+                  ">
+                    ${p.location}
+                  </div>
+                ` : ""}
+
+                <!-- Email -->
+                ${p.email ? `
+                  <div style="
+                    font-size:11px;font-weight:700;color:#6B7280;
+                    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+                  ">
+                    ${p.email}
+                  </div>
+                ` : ""}
+
               </div>
             </div>
-          `;
+          `;     
         })
         .render();
 
