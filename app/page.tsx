@@ -2,16 +2,15 @@
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import Papa from "papaparse";
-import * as d3 from "d3";
 
 type Row = {
   Name: string;
   "Work Email": string;
   "Manager Email": string;
-  Team?: string;
+  Team: string;
   Pod?: string;
-  Location?: string;
-  "Photo URL"?: string;
+  Location: string; // country burada
+  "Photo URL": string;
 };
 
 function normalizeEmail(v: string) {
@@ -25,40 +24,65 @@ function ensureHttps(url: string) {
   return `https://${u}`;
 }
 
-// Pod normalize: CSV’deki küçük farkları tek isme indir (çok kritik!)
-function normalizePod(v: string) {
-  const raw = (v || "").trim();
-  if (!raw) return "";
-
-  const x = raw
-    .replace(/’/g, "'") // curly apostrophe -> normal
+/** Pod tekilleştirme (FO / Founder’s Office vs.) */
+function normalizePod(podRaw: string) {
+  const p = (podRaw || "")
+    .trim()
     .replace(/\s+/g, " ")
-    .trim();
+    .replace(/[’‘]/g, "'"); // apostrophe normalize
 
-  const lower = x.toLowerCase();
+  if (!p) return "";
 
-  // örnek mapping: ihtiyacına göre genişlet
-  if (lower === "fo") return "Founder's Office";
-  if (lower === "founders office") return "Founder's Office";
-  if (lower === "founder's office") return "Founder's Office";
+  const key = p.toLowerCase();
 
-  return x;
+  // burada mapping’i istediğin gibi büyütebilirsin
+  const map: Record<string, string> = {
+    "fo": "Founder's Office",
+    "founders office": "Founder's Office",
+    "founder's office": "Founder's Office",
+    "founder’s office": "Founder's Office",
+    "cx": "CX",
+    "qa eng.": "QA Eng.",
+  };
+
+  return map[key] ?? p;
 }
+
+/** Pod’a göre renk (deterministic) */
+function hashToIndex(s: string, mod: number) {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  return mod ? h % mod : 0;
+}
+
+const POD_COLORS = [
+  { border: "#2563EB", bg: "#EFF6FF" }, // blue
+  { border: "#7C3AED", bg: "#F5F3FF" }, // purple
+  { border: "#059669", bg: "#ECFDF5" }, // green
+  { border: "#DC2626", bg: "#FEF2F2" }, // red
+  { border: "#EA580C", bg: "#FFF7ED" }, // orange
+  { border: "#0F766E", bg: "#F0FDFA" }, // teal
+  { border: "#4F46E5", bg: "#EEF2FF" }, // indigo
+  { border: "#B45309", bg: "#FFFBEB" }, // amber
+  { border: "#BE185D", bg: "#FDF2F8" }, // pink
+  { border: "#374151", bg: "#F9FAFB" }, // gray
+];
 
 export default function ClientPage() {
   const chartRef = useRef<HTMLDivElement | null>(null);
   const chartObjRef = useRef<any>(null);
 
   const [isEdit, setIsEdit] = useState(false);
+  const [rows, setRows] = useState<Row[]>([]);
+  const [error, setError] = useState<string>("");
+
+  // edit mode only by ?edit=1
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     setIsEdit(params.get("edit") === "1");
   }, []);
 
-  const [rows, setRows] = useState<Row[]>([]);
-  const [error, setError] = useState<string>("");
-
-  // shared csv load
+  // Load shared CSV
   useEffect(() => {
     fetch("/api/org")
       .then(async (r) => {
@@ -74,16 +98,19 @@ export default function ClientPage() {
             setError(err instanceof Error ? err.message : String(err)),
         });
       })
-      .catch(() => {});
+      .catch(() => {
+        // first run: no CSV yet
+      });
   }, []);
-
-  const NODE_W = 320;
-  const NODE_H = 120;
 
   const nodes = useMemo(() => {
     const built = rows.map((r, i) => {
       const workEmail = String(r["Work Email"] || "").trim();
       const name = String(r.Name || "").trim();
+
+      const pod = normalizePod(String(r.Pod || ""));
+      const podColor =
+        pod ? POD_COLORS[hashToIndex(pod, POD_COLORS.length)] : null;
 
       return {
         id: workEmail ? normalizeEmail(workEmail) : `name:${name.toLowerCase()}:${i}`,
@@ -91,137 +118,26 @@ export default function ClientPage() {
 
         name: name || workEmail || "(no name)",
         email: workEmail,
-
         team: String(r.Team || "").trim(),
-        pod: normalizePod(String(r.Pod || "")),
-
+        pod,
+        podBorder: podColor?.border || "#E5E7EB",
+        podBg: podColor?.bg || "#FFFFFF",
         location: String(r.Location || "").trim(),
         photoUrl:
-          ensureHttps(String(r["Photo URL"] || "")) ||
+          ensureHttps(r["Photo URL"] || "") ||
           `https://ui-avatars.com/api/?background=eee&color=555&name=${encodeURIComponent(
             name || "User"
           )}`,
       };
     });
 
-    // manager id not in dataset => root
+    // if manager not in set, make root
     const ids = new Set(built.map((n) => n.id));
     return built.map((n) => ({
       ...n,
       parentId: n.parentId && ids.has(n.parentId) ? n.parentId : null,
     }));
   }, [rows]);
-
-  // helper: parse translate(x,y)
-  function parseTranslate(transform: string | null) {
-    if (!transform) return null;
-    const m = /translate\(([-\d.]+),\s*([-\d.]+)\)/.exec(transform);
-    if (!m) return null;
-    return { x: parseFloat(m[1]), y: parseFloat(m[2]) };
-  }
-
-  // Draw pod grouping rectangles behind nodes (visual grouping, NOT hierarchy)
-  function drawPodGroups() {
-    if (!chartRef.current) return;
-
-    const root = d3.select(chartRef.current);
-    const svg = root.select("svg");
-    if (svg.empty()) return;
-
-    // Remove old layer
-    svg.selectAll("g.pod-group-layer").remove();
-
-    // Create a layer behind nodes
-    const layer = svg.insert("g", ":first-child")
-      .attr("class", "pod-group-layer")
-      .style("pointer-events", "none");
-
-    // Collect node positions from rendered DOM
-    const rendered: Array<{
-      id: string;
-      parentId: string | null;
-      pod: string;
-      x: number;
-      y: number;
-    }> = [];
-
-    root.selectAll("g.node").each(function () {
-      const g = d3.select(this);
-      const datum: any = g.datum();
-      const t = parseTranslate(g.attr("transform"));
-      if (!datum?.data || !t) return;
-
-      rendered.push({
-        id: datum.data.id,
-        parentId: datum.data.parentId ?? null,
-        pod: datum.data.pod ?? "",
-        x: t.x,
-        y: t.y,
-      });
-    });
-
-    if (!rendered.length) return;
-
-    // Group by (parentId + pod) — only for children that have a pod
-    const byParentPod = d3.group(
-      rendered.filter((n) => n.parentId && n.pod),
-      (n) => n.parentId as string,
-      (n) => n.pod as string
-    );
-
-    const PADDING = 18;
-    const LABEL_H = 22;
-
-    for (const [parentId, pods] of byParentPod.entries()) {
-      // If parent has only 1 pod group, still draw (optional). İstersen burada filtreleyebilirsin.
-      for (const [pod, items] of pods.entries()) {
-        if (items.length < 2) continue; // tek kişi için kutu çizme (istersen kaldır)
-
-        const minX = d3.min(items, (d) => d.x) ?? 0;
-        const minY = d3.min(items, (d) => d.y) ?? 0;
-        const maxX = d3.max(items, (d) => d.x) ?? 0;
-        const maxY = d3.max(items, (d) => d.y) ?? 0;
-
-        const x = minX - PADDING;
-        const y = minY - PADDING - LABEL_H;
-        const w = (maxX - minX) + NODE_W + PADDING * 2;
-        const h = (maxY - minY) + NODE_H + PADDING * 2 + LABEL_H;
-
-        // Group container
-        const g = layer.append("g").attr("transform", `translate(${x},${y})`);
-
-        // Background rect
-        g.append("rect")
-          .attr("width", w)
-          .attr("height", h)
-          .attr("rx", 18)
-          .attr("ry", 18)
-          .attr("fill", "rgba(99,102,241,0.06)")      // çok hafif indigo
-          .attr("stroke", "rgba(99,102,241,0.25)")   // hafif border
-          .attr("stroke-width", 1.2);
-
-        // Label chip
-        g.append("rect")
-          .attr("x", 14)
-          .attr("y", 10)
-          .attr("width", Math.min(220, 12 + pod.length * 7.2))
-          .attr("height", 22)
-          .attr("rx", 999)
-          .attr("ry", 999)
-          .attr("fill", "rgba(99,102,241,0.14)")
-          .attr("stroke", "rgba(99,102,241,0.20)")
-          .attr("stroke-width", 1);
-
-        g.append("text")
-          .attr("x", 24)
-          .attr("y", 26)
-          .attr("font-size", 12)
-          .attr("font-weight", 800)
-          .attr("fill", "#3730A3")
-          .text(pod);
-      }
-    }
-  }
 
   // Render chart
   useEffect(() => {
@@ -233,23 +149,21 @@ export default function ClientPage() {
     }
 
     chartRef.current.innerHTML = "";
-
     let cancelled = false;
 
     (async () => {
       const mod = await import("d3-org-chart");
       const OrgChart = (mod as any).OrgChart;
-
       if (cancelled || !chartRef.current) return;
 
       const chart = new OrgChart()
         .container(chartRef.current)
         .data(nodes)
-        .nodeWidth(() => NODE_W)
-        .nodeHeight(() => NODE_H)
+        .nodeWidth(() => 340)
+        .nodeHeight(() => 120)
         .childrenMargin(() => 55)
-        .compactMarginBetween(() => 40)
-        .compactMarginPair(() => 90)
+        .compactMarginBetween(() => 35)
+        .compactMarginPair(() => 80)
         .nodeContent((d: any) => {
           const p = d.data;
 
@@ -258,28 +172,68 @@ export default function ClientPage() {
                  style="width:64px;height:64px;border-radius:16px;object-fit:cover;border:1px solid rgba(0,0,0,0.12)" />`
             : `<div style="width:64px;height:64px;border-radius:16px;background:rgba(0,0,0,0.06);
                  display:flex;align-items:center;justify-content:center;font-weight:800;">
-                 ${String(p.name).trim().slice(0, 1).toUpperCase()}
-               </div>`;
+               ${String(p.name).trim().slice(0, 1).toUpperCase()}
+             </div>`;
 
-          // sadece 4 satır: name/team/country/email
+          // ONLY: Name / Team / Country(Location) / Email
+          // Pod: small badge (does not replace team)
           return `
             <div style="
-              width:${NODE_W}px;height:${NODE_H}px;background:#fff;border:1px solid rgba(0,0,0,0.12);
-              border-radius:16px;box-shadow:0 3px 14px rgba(0,0,0,0.07);
-              padding:12px;display:flex;gap:12px;align-items:center;
+              width:340px;height:120px;
+              background:${p.podBg};
+              border:1px solid rgba(0,0,0,0.12);
+              border-left:8px solid ${p.podBorder};
+              border-radius:16px;
+              box-shadow:0 4px 14px rgba(0,0,0,0.08);
+              padding:12px;
+              display:flex;gap:12px;align-items:center;
             ">
               ${img}
+
               <div style="display:flex;flex-direction:column;gap:6px;min-width:0;flex:1;">
-                <div style="font-weight:900;font-size:16px;line-height:1.15;color:#111827;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
-                  ${p.name}
+                <div style="
+                  display:flex;align-items:center;justify-content:space-between;gap:8px;
+                  min-width:0;
+                ">
+                  <div style="
+                    font-weight:900;font-size:16px;line-height:1.15;color:#111827;
+                    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+                    min-width:0;
+                  ">
+                    ${p.name}
+                  </div>
+
+                  ${
+                    p.pod
+                      ? `<span style="
+                          font-size:11px;font-weight:900;color:${p.podBorder};
+                          background:#FFFFFFCC;
+                          border:1px solid ${p.podBorder}33;
+                          padding:2px 8px;border-radius:999px;
+                          white-space:nowrap;
+                        ">${p.pod}</span>`
+                      : ""
+                  }
                 </div>
-                <div style="font-size:13px;font-weight:800;color:#111827;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+
+                <div style="
+                  font-size:13px;font-weight:800;color:#111827;
+                  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+                ">
                   ${p.team || ""}
                 </div>
-                <div style="font-size:12px;font-weight:700;color:#374151;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+
+                <div style="
+                  font-size:12px;font-weight:800;color:#374151;
+                  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+                ">
                   ${p.location || ""}
                 </div>
-                <div style="font-size:12px;font-weight:700;color:#6B7280;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+
+                <div style="
+                  font-size:12px;font-weight:800;color:#6B7280;
+                  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+                ">
                   ${p.email || ""}
                 </div>
               </div>
@@ -289,9 +243,6 @@ export default function ClientPage() {
         .render();
 
       chartObjRef.current = chart;
-
-      // Draw pod groups after render (DOM oluşsun)
-      requestAnimationFrame(() => drawPodGroups());
     })();
 
     return () => {
@@ -301,6 +252,7 @@ export default function ClientPage() {
 
   async function uploadCsvToServer(file: File) {
     setError("");
+
     const pw = prompt("Admin password?");
     if (!pw) return;
 
@@ -328,16 +280,9 @@ export default function ClientPage() {
     });
   }
 
-  // Wrap buttons to redraw groups after expand/collapse/fit
-  function afterAction(fn: () => void) {
-    fn();
-    // render sonrası kutuları yeniden çiz
-    setTimeout(() => drawPodGroups(), 60);
-  }
-
   return (
     <div style={{ padding: 20, fontFamily: "system-ui, -apple-system, Segoe UI, Roboto" }}>
-      <h1 style={{ fontSize: 26, fontWeight: 800, margin: "0 0 16px 0" }}>
+      <h1 style={{ fontSize: 26, fontWeight: 900, margin: "0 0 16px 0" }}>
         Aspora Organisational Chart
       </h1>
 
@@ -358,19 +303,19 @@ export default function ClientPage() {
           />
         )}
 
-        <button onClick={() => afterAction(() => chartObjRef.current?.fit())} style={{ padding: "8px 12px" }}>
+        <button onClick={() => chartObjRef.current?.fit()} style={{ padding: "8px 12px" }}>
           Fit
         </button>
-        <button onClick={() => afterAction(() => chartObjRef.current?.expandAll())} style={{ padding: "8px 12px" }}>
+        <button onClick={() => chartObjRef.current?.expandAll()} style={{ padding: "8px 12px" }}>
           Expand
         </button>
-        <button onClick={() => afterAction(() => chartObjRef.current?.collapseAll())} style={{ padding: "8px 12px" }}>
+        <button onClick={() => chartObjRef.current?.collapseAll()} style={{ padding: "8px 12px" }}>
           Collapse
         </button>
       </div>
 
       {error ? (
-        <div style={{ color: "#b00020", fontWeight: 700, marginBottom: 12 }}>{error}</div>
+        <div style={{ color: "#b00020", fontWeight: 800, marginBottom: 12 }}>{error}</div>
       ) : null}
 
       <div
