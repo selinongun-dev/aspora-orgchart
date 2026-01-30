@@ -5,12 +5,11 @@ import Papa from "papaparse";
 
 type Row = {
   Name: string;
-  "Work Email"?: string;
-  "Manager Email"?: string;
+  "Work Email": string;
+  "Manager Email": string;
   Team?: string;
-  Pod?: string;
-  Location?: string; // we will also accept "Country" as alias
-  Country?: string;  // alias
+  Pod?: string; // optional
+  Location?: string; // country
   "Photo URL"?: string;
 };
 
@@ -25,25 +24,24 @@ function ensureHttps(url: string) {
   return `https://${u}`;
 }
 
-function slugify(s: string) {
-  return (s || "")
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, "-")
-    .replace(/[^a-z0-9\-_]/g, "");
+// Pod başına tutarlı renk üretmek için basit hash -> HSL
+function podColor(pod: string) {
+  const s = (pod || "").trim();
+  if (!s) return { bg: "rgba(0,0,0,0)", border: "rgba(0,0,0,0)" };
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) % 360;
+  return {
+    bg: `hsla(${h}, 70%, 95%, 1)`,
+    border: `hsla(${h}, 65%, 45%, 1)`,
+  };
 }
 
-// Required headers: Pod optional, Country optional (Location OR Country must exist)
 function requiredColsMissing(headers: string[]) {
-  const baseRequired = ["Name", "Work Email", "Manager Email", "Team", "Photo URL"];
+  // Pod opsiyonel, ama header varsa okuyalım.
+  // Temel beklediğimiz kolonlar:
+  const required = ["Name", "Work Email", "Manager Email", "Team", "Location", "Photo URL"];
   const set = new Set(headers);
-
-  const missingBase = baseRequired.filter((c) => !set.has(c));
-
-  const hasLocationOrCountry = set.has("Location") || set.has("Country");
-  const missingLocation = hasLocationOrCountry ? [] : ["Location (or Country)"];
-
-  return [...missingBase, ...missingLocation];
+  return required.filter((c) => !set.has(c));
 }
 
 export default function ClientPage() {
@@ -54,13 +52,13 @@ export default function ClientPage() {
   const [rows, setRows] = useState<Row[]>([]);
   const [error, setError] = useState<string>("");
 
-  // Determine edit mode from querystring (?edit=1) on client only
+  // edit mode sadece client-side query’den okunur
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     setIsEdit(params.get("edit") === "1");
   }, []);
 
-  // Load shared CSV from server on first load (works for view-only users)
+  // View-only dahil: server'daki CSV'yi çek
   useEffect(() => {
     fetch("/api/org")
       .then(async (r) => {
@@ -77,99 +75,62 @@ export default function ClientPage() {
         });
       })
       .catch(() => {
-        // normal on first run (no CSV uploaded yet)
+        // ilk kurulumda CSV yoksa normal
       });
   }, []);
 
   const nodes = useMemo(() => {
-    // 1) Build person nodes
-    const people = rows
-      .map((r, i) => {
-        const name = String((r as any)["Name"] ?? "").trim();
-        const workEmail = String((r as any)["Work Email"] ?? "").trim();
-        const managerEmail = String((r as any)["Manager Email"] ?? "").trim();
-        const team = String((r as any)["Team"] ?? "").trim();
-        const pod = String((r as any)["Pod"] ?? "").trim();
-        const country = String((r as any)["Country"] ?? (r as any)["Location"] ?? "").trim();
-        const photoRaw = String((r as any)["Photo URL"] ?? "").trim();
+    // KİŞİLER DIŞINDA HİÇBİR NODE YOK.
+    // Sadece person nodes -> hierarchy = manager email
+    const built = rows.map((r, i) => {
+      const name = String(r.Name || "").trim();
+      const workEmail = String(r["Work Email"] || "").trim();
+      const mgrEmail = String(r["Manager Email"] || "").trim();
 
-        // Skip totally empty rows (prevents d3-org-chart crash)
-        if (!name && !workEmail) return null;
+      const id = workEmail
+        ? normalizeEmail(workEmail)
+        : `name:${name.toLowerCase()}:${i}`;
 
-        const id =
-          workEmail ? normalizeEmail(workEmail) : `person:${slugify(name)}:${i}`;
-
-        const parentId = managerEmail ? normalizeEmail(managerEmail) : null;
-
-        return {
-          id,
-          parentId,
-          type: "person" as const,
-          name: name || workEmail || "(no name)",
-          email: workEmail,
-          team,
-          pod,
-          country,
-          photoUrl:
-            ensureHttps(photoRaw) ||
-            `https://ui-avatars.com/api/?background=eee&color=555&name=${encodeURIComponent(
-              name || "User"
-            )}`,
-        };
-      })
-      .filter(Boolean) as any[];
-
-    // Ensure unique IDs (duplicates can break chart)
-    const seen = new Map<string, number>();
-    for (const p of people) {
-      const count = (seen.get(p.id) || 0) + 1;
-      seen.set(p.id, count);
-      if (count > 1) p.id = `${p.id}__${count}`;
-    }
-
-    // 2) Fix parent references (if manager not found, treat as root)
-    const idSet = new Set(people.map((p) => p.id));
-    const normalizedPeople = people.map((p) => ({
-      ...p,
-      parentId: p.parentId && idSet.has(p.parentId) ? p.parentId : null,
-    }));
-
-    // 3) Pod grouping: create synthetic "pod" nodes under each manager
-    // For each person with a pod + has a manager, we:
-    // manager -> podNode -> person
-    const podNodes: any[] = [];
-    const podNodeIdByKey = new Map<string, string>();
-
-    function getPodNodeId(managerId: string | null, podName: string) {
-      const key = `${managerId || "root"}::${podName}`;
-      if (podNodeIdByKey.has(key)) return podNodeIdByKey.get(key)!;
-
-      const podId = `pod:${managerId || "root"}:${slugify(podName) || "unknown"}`;
-      podNodeIdByKey.set(key, podId);
-
-      podNodes.push({
-        id: podId,
-        parentId: managerId, // null for root-level pods
-        type: "pod" as const,
-        name: podName,
-      });
-
-      return podId;
-    }
-
-    const withPods = normalizedPeople.map((p) => {
-      const podName = String(p.pod || "").trim();
-      if (!podName) return p;
-
-      // group under pod node
-      const podId = getPodNodeId(p.parentId ?? null, podName);
-      return { ...p, parentId: podId };
+      return {
+        id,
+        parentId: mgrEmail ? normalizeEmail(mgrEmail) : null,
+        name: name || "(no name)",
+        email: workEmail,
+        team: String(r.Team || "").trim(),
+        pod: String(r.Pod || "").trim(),
+        location: String(r.Location || "").trim(),
+        photoUrl:
+          ensureHttps(r["Photo URL"] || "") ||
+          `https://ui-avatars.com/api/?background=eee&color=555&name=${encodeURIComponent(
+            name || "User"
+          )}`,
+      };
     });
 
-    return [...podNodes, ...withPods];
+    // parent dataset'te yoksa root yap
+    const ids = new Set(built.map((n) => n.id));
+    let cleaned = built.map((n) => ({
+      ...n,
+      parentId: n.parentId && ids.has(n.parentId) ? n.parentId : null,
+    }));
+
+    // Pod'a göre "aynı manager altındaki" kişileri yan yana getirmek için:
+    // d3-org-chart child sırasını data order'dan etkilenerek oluşturuyor (genelde).
+    // parentId -> pod -> name sıralaması iyi kümeler.
+    cleaned = cleaned.sort((a, b) => {
+      const pa = a.parentId || "";
+      const pb = b.parentId || "";
+      if (pa !== pb) return pa.localeCompare(pb);
+      const poda = (a.pod || "").toLowerCase();
+      const podb = (b.pod || "").toLowerCase();
+      if (poda !== podb) return poda.localeCompare(podb);
+      return (a.name || "").localeCompare(b.name || "");
+    });
+
+    return cleaned;
   }, [rows]);
 
-  // Render chart whenever nodes change
+  // Render chart
   useEffect(() => {
     if (!chartRef.current) return;
 
@@ -190,72 +151,70 @@ export default function ClientPage() {
       const chart = new OrgChart()
         .container(chartRef.current)
         .data(nodes)
-        .nodeWidth((d: any) => (d.data.type === "pod" ? 220 : 320))
-        .nodeHeight((d: any) => (d.data.type === "pod" ? 56 : 120))
+        .nodeWidth(() => 320)
+        .nodeHeight(() => 120)
         .childrenMargin(() => 50)
         .compactMarginBetween(() => 35)
         .compactMarginPair(() => 80)
         .nodeContent((d: any) => {
           const p = d.data;
+          const c = podColor(p.pod);
 
-          // POD GROUP NODE (sanal node)
-          if (p.type === "pod") {
-            return `
-              <div style="
-                width:220px;height:56px;background:#F3F4F6;border:1px solid rgba(0,0,0,0.10);
-                border-radius:14px;display:flex;align-items:center;justify-content:center;
-                font-weight:900;font-size:14px;color:#111827;
-                box-shadow:0 2px 10px rgba(0,0,0,0.05);
-              ">
-                ${p.name}
-              </div>
-            `;
-          }
-
-          // PERSON NODE (sadece 4 satır: name, team, country, email)
           const img = p.photoUrl
             ? `<img src="${p.photoUrl}" crossorigin="anonymous"
-                   style="width:64px;height:64px;border-radius:16px;object-fit:cover;border:1px solid rgba(0,0,0,0.12)" />`
+                 style="width:64px;height:64px;border-radius:16px;object-fit:cover;border:1px solid rgba(0,0,0,0.12)" />`
             : `<div style="width:64px;height:64px;border-radius:16px;background:rgba(0,0,0,0.06);
-                   display:flex;align-items:center;justify-content:center;font-weight:900;">
-                 ${String(p.name).trim().slice(0, 1).toUpperCase()}
-               </div>`;
+                 display:flex;align-items:center;justify-content:center;font-weight:800;">
+               ${String(p.name).trim().slice(0, 1).toUpperCase()}
+             </div>`;
 
+          // İSTEDİĞİN 4 satır: Name / Team / Country(Location) / Email
+          // Pod: ayrı satır yapmıyoruz; sadece görsel label + sol border olarak "gruplama hissi"
           return `
             <div style="
-              width:320px;height:120px;background:#fff;border:1px solid rgba(0,0,0,0.14);
-              border-radius:16px;box-shadow:0 4px 14px rgba(0,0,0,0.08);
-              padding:12px;display:flex;gap:12px;align-items:center;
+              width:320px;height:120px;
+              background:${c.bg};
+              border:1px solid rgba(0,0,0,0.14);
+              border-left:6px solid ${c.border};
+              border-radius:16px;
+              box-shadow:0 4px 14px rgba(0,0,0,0.08);
+              padding:12px;
+              display:flex;gap:12px;align-items:center;
+              position:relative;
             ">
+              ${
+                p.pod
+                  ? `<div style="
+                      position:absolute;top:10px;right:12px;
+                      font-size:11px;font-weight:800;color:#111827;
+                      background:rgba(255,255,255,0.75);
+                      border:1px solid rgba(0,0,0,0.08);
+                      padding:2px 8px;border-radius:999px;
+                      max-width:150px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+                    ">${p.pod}</div>`
+                  : ``
+              }
               ${img}
               <div style="display:flex;flex-direction:column;gap:6px;min-width:0;flex:1;">
                 <div style="
                   font-weight:900;font-size:16px;line-height:1.15;color:#111827;
                   white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-                ">
-                  ${p.name}
-                </div>
+                ">${p.name}</div>
 
                 <div style="
                   font-size:13px;font-weight:800;color:#111827;
                   white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-                ">
-                  ${p.team || ""}
-                </div>
+                ">${p.team || ""}</div>
 
                 <div style="
-                  font-size:12px;font-weight:800;color:#374151;
+                  font-size:12px;font-weight:700;color:#374151;
                   white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-                ">
-                  ${p.country || ""}
-                </div>
+                ">${p.location || ""}</div>
 
                 <div style="
-                  font-size:12px;font-weight:800;color:#6B7280;
+                  font-size:11px;font-weight:700;color:#6B7280;
                   white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-                ">
-                  ${p.email || ""}
-                </div>
+                ">${p.email || ""}</div>
               </div>
             </div>
           `;
@@ -272,19 +231,8 @@ export default function ClientPage() {
 
   async function uploadCsvToServer(file: File) {
     setError("");
-
     const pw = prompt("Admin password?");
     if (!pw) return;
-
-    // (Optional) quick header validation before upload
-    const text = await file.text();
-    const parsed = Papa.parse(text, { header: true, skipEmptyLines: true });
-    const headers = ((parsed as any).meta?.fields || []) as string[];
-    const missing = requiredColsMissing(headers);
-    if (missing.length) {
-      setError(`Missing required columns: ${missing.join(", ")}`);
-      return;
-    }
 
     const fd = new FormData();
     fd.append("file", file);
@@ -300,7 +248,7 @@ export default function ClientPage() {
       return;
     }
 
-    // Reload from shared source
+    // Reload
     const csv = await (await fetch("/api/org")).text();
     Papa.parse<Row>(csv, {
       header: true,
@@ -363,7 +311,8 @@ export default function ClientPage() {
       </div>
 
       <div style={{ marginTop: 10, opacity: 0.7, fontSize: 12 }}>
-        CSV headers expected: Name, Work Email, Manager Email, Team, Photo URL, Location (or Country), optional: Pod
+        CSV headers: Name, Work Email, Manager Email, Team, Location, Photo URL (optional: Pod).
+        Pod is used for visual grouping + sorting; hierarchy stays Manager Email.
       </div>
     </div>
   );
