@@ -7,10 +7,26 @@ type Row = {
   Name: string;
   "Work Email": string;
   "Manager Email": string;
-  Team: string;
-  Pod?: string;  
-  Location: string;
-  "Photo URL": string;
+  Team?: string;
+  Pod?: string; // ✅ new
+  Location?: string;
+  "Photo URL"?: string;
+};
+
+type NodeData = {
+  type: "pod" | "person";
+  id: string;
+  parentId: string | null;
+
+  // shared
+  name: string;
+
+  // person-only
+  email?: string;
+  team?: string;
+  pod?: string;
+  location?: string;
+  photoUrl?: string;
 };
 
 function normalizeEmail(v: string) {
@@ -24,10 +40,12 @@ function ensureHttps(url: string) {
   return `https://${u}`;
 }
 
-function requiredColsMissing(headers: string[]) {
-  const required = ["Name", "Work Email", "Manager Email", "Team", "Location", "Photo URL"];
-  const set = new Set(headers);
-  return required.filter((c) => !set.has(c));
+function sanitizeIdPart(v: string) {
+  return (v || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "-")
+    .replace(/[^a-z0-9\-_.:]/g, "");
 }
 
 export default function ClientPage() {
@@ -35,29 +53,31 @@ export default function ClientPage() {
   const chartObjRef = useRef<any>(null);
 
   const [isEdit, setIsEdit] = useState(false);
+  const [rows, setRows] = useState<Row[]>([]);
+  const [error, setError] = useState<string>("");
 
+  // Determine edit mode on client
   useEffect(() => {
-    // client-side only
     const params = new URLSearchParams(window.location.search);
     setIsEdit(params.get("edit") === "1");
   }, []);
-
-  const [rows, setRows] = useState<Row[]>([]);
-  const [error, setError] = useState<string>("");
 
   // Load shared CSV from server on first load (view-only users included)
   useEffect(() => {
     fetch("/api/org")
       .then(async (r) => {
+        if (r.status === 204) return ""; // no CSV yet
         if (!r.ok) throw new Error(await r.text());
         return r.text();
       })
       .then((text) => {
+        if (!text) return;
         Papa.parse<Row>(text, {
           header: true,
           skipEmptyLines: true,
           complete: (res) => setRows((res.data || []) as Row[]),
-          error: (err: unknown) => setError(err instanceof Error ? err.message : String(err)),
+          error: (err: unknown) =>
+            setError(err instanceof Error ? err.message : String(err)),
         });
       })
       .catch(() => {
@@ -65,33 +85,74 @@ export default function ClientPage() {
       });
   }, []);
 
-  const nodes = useMemo(() => {
-    const built = rows.map((r, i) => {
-      const workEmail = String(r["Work Email"] || "").trim();
+  /**
+   * Build org chart nodes.
+   * - Real reporting hierarchy stays intact (manager edges win).
+   * - People whose manager is missing are grouped under their Pod header.
+   * - If a person has neither a valid manager nor a Pod, they become top-level.
+   */
+  const nodes = useMemo<NodeData[]>(() => {
+    // 1) Build all person nodes first
+    const people: NodeData[] = rows.map((r, i) => {
+      const workEmailRaw = String(r["Work Email"] || "").trim();
       const name = String(r.Name || "").trim();
+      const pod = String(r.Pod || "").trim();
+
+      const id = workEmailRaw
+        ? normalizeEmail(workEmailRaw)
+        : `name:${sanitizeIdPart(name)}:${i}`;
+
+      const photoUrl =
+        ensureHttps(String(r["Photo URL"] || "")) ||
+        `https://ui-avatars.com/api/?background=eee&color=555&name=${encodeURIComponent(
+          name || "User"
+        )}`;
 
       return {
-        id: workEmail ? normalizeEmail(workEmail) : `name:${name.toLowerCase()}:${i}`,
-        parentId: normalizeEmail(r["Manager Email"]) || null,
-        name: name || workEmail || "(no name)",
-        email: workEmail,
+        type: "person",
+        id,
+        parentId: normalizeEmail(String(r["Manager Email"] || "")) || null,
+        name: name || workEmailRaw || "(no name)",
+        email: workEmailRaw,
         team: String(r.Team || "").trim(),
-        pod: (r.Pod || "").trim(), 
+        pod,
         location: String(r.Location || "").trim(),
-        photoUrl:
-          ensureHttps(r["Photo URL"] || "") ||
-          `https://ui-avatars.com/api/?background=eee&color=555&name=${encodeURIComponent(
-            name || "User"
-          )}`,
+        photoUrl,
       };
     });
 
-    // If manager id is not present in data, treat as root
-    const ids = new Set(built.map((n) => n.id));
-    return built.map((n) => ({
-      ...n,
-      parentId: n.parentId && ids.has(n.parentId) ? n.parentId : null,
+    const personIds = new Set(people.map((p) => p.id));
+
+    // 2) Create Pod header nodes
+    const podNames = Array.from(
+      new Set(people.map((p) => (p.pod || "").trim()).filter(Boolean))
+    );
+
+    const podNodes: NodeData[] = podNames.map((podName) => ({
+      type: "pod",
+      id: `pod:${sanitizeIdPart(podName)}`,
+      parentId: null,
+      name: podName,
     }));
+
+    const podIdByName = new Map(podNodes.map((p) => [p.name, p.id]));
+
+    // 3) Fix parent links
+    const finalPeople = people.map((p) => {
+      const mgr = p.parentId;
+
+      // If manager exists within dataset, keep real hierarchy
+      if (mgr && personIds.has(mgr)) return p;
+
+      // Otherwise group under pod header if available
+      const podParent = p.pod ? podIdByName.get(p.pod) : null;
+      return {
+        ...p,
+        parentId: podParent || null,
+      };
+    });
+
+    return [...podNodes, ...finalPeople];
   }, [rows]);
 
   // Render chart when nodes change
@@ -105,7 +166,6 @@ export default function ClientPage() {
     }
 
     chartRef.current.innerHTML = "";
-
     let cancelled = false;
 
     (async () => {
@@ -118,18 +178,33 @@ export default function ClientPage() {
         .container(chartRef.current)
         .data(nodes)
         .nodeWidth(() => 320)
-        .nodeHeight(() => 120)
+        .nodeHeight(() => 128)
         .childrenMargin(() => 50)
         .compactMarginBetween(() => 35)
         .compactMarginPair(() => 80)
         .nodeContent((d: any) => {
-          const p = d.data;
+          const p: NodeData = d.data;
 
+          // ✅ Pod header card (grouping)
+          if (p.type === "pod") {
+            return `
+              <div style="
+                width:320px;height:64px;background:#0F172A;color:white;
+                border-radius:14px;display:flex;align-items:center;justify-content:center;
+                font-weight:900;font-size:16px;letter-spacing:0.2px;
+                box-shadow:0 6px 18px rgba(0,0,0,0.12);
+              ">
+                ${p.name}
+              </div>
+            `;
+          }
+
+          // ✅ Person card (Team is under Name, Pod NOT shown here)
           const img = p.photoUrl
             ? `<img src="${p.photoUrl}" crossorigin="anonymous"
                    style="width:64px;height:64px;border-radius:16px;object-fit:cover;border:1px solid rgba(0,0,0,0.12)" />`
             : `<div style="width:64px;height:64px;border-radius:16px;background:rgba(0,0,0,0.06);
-                   display:flex;align-items:center;justify-content:center;font-weight:700;">
+                   display:flex;align-items:center;justify-content:center;font-weight:800;">
                  ${String(p.name).trim().slice(0, 1).toUpperCase()}
                </div>`;
 
@@ -141,8 +216,7 @@ export default function ClientPage() {
             ">
               ${img}
               <div style="display:flex;flex-direction:column;gap:7px;min-width:0;flex:1;">
-                
-                <!-- Name (daha büyük + daha koyu) -->
+
                 <div style="
                   font-weight:900;font-size:16px;line-height:1.15;color:#111827;
                   white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
@@ -150,32 +224,15 @@ export default function ClientPage() {
                   ${p.name}
                 </div>
 
-                <!-- Team + Pod (badge) -->
-                <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
-                  ${p.team ? `
-                    <span style="
-                      font-size:12px;font-weight:800;color:#111827;
-                      background:#F3F4F6;border:1px solid rgba(0,0,0,0.08);
-                      padding:2px 8px;border-radius:999px;
-                      white-space:nowrap;max-width:220px;overflow:hidden;text-overflow:ellipsis;
-                    ">
-                      ${p.team}
-                    </span>
-                  ` : ""}
+                ${p.team ? `
+                  <div style="
+                    font-size:12px;font-weight:800;color:#111827;
+                    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+                  ">
+                    ${p.team}
+                  </div>
+                ` : ""}
 
-                  ${p.pod ? `
-                    <span style="
-                      font-size:12px;font-weight:800;color:#1E3A8A;
-                      background:#EEF2FF;border:1px solid rgba(30,58,138,0.15);
-                      padding:2px 8px;border-radius:999px;
-                      white-space:nowrap;max-width:220px;overflow:hidden;text-overflow:ellipsis;
-                    ">
-                      ${p.pod}
-                    </span>
-                  ` : ""}
-                </div>
-
-                <!-- Location -->
                 ${p.location ? `
                   <div style="
                     font-size:12px;font-weight:700;color:#374151;
@@ -185,7 +242,6 @@ export default function ClientPage() {
                   </div>
                 ` : ""}
 
-                <!-- Email -->
                 ${p.email ? `
                   <div style="
                     font-size:11px;font-weight:700;color:#6B7280;
@@ -197,7 +253,7 @@ export default function ClientPage() {
 
               </div>
             </div>
-          `;     
+          `;
         })
         .render();
 
@@ -235,7 +291,8 @@ export default function ClientPage() {
       header: true,
       skipEmptyLines: true,
       complete: (r) => setRows((r.data || []) as Row[]),
-      error: (err: unknown) => setError(err instanceof Error ? err.message : String(err)),
+      error: (err: unknown) =>
+        setError(err instanceof Error ? err.message : String(err)),
     });
   }
 
@@ -294,7 +351,7 @@ export default function ClientPage() {
       </div>
 
       <div style={{ marginTop: 10, opacity: 0.7, fontSize: 12 }}>
-        Headers required, values optional except Name.
+        CSV headers expected: Name, Work Email, Manager Email, Team, Location, Photo URL (optional: Pod)
       </div>
     </div>
   );
