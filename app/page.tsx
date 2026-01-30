@@ -9,7 +9,8 @@ type Row = {
   "Manager Email"?: string;
   Team?: string;
   Pod?: string;
-  Location?: string;
+  Location?: string; // we will also accept "Country" as alias
+  Country?: string;  // alias
   "Photo URL"?: string;
 };
 
@@ -24,45 +25,25 @@ function ensureHttps(url: string) {
   return `https://${u}`;
 }
 
-function cleanHeader(h: string) {
-  // trim + remove BOM (﻿) if present
-  return (h || "").trim().replace(/^\uFEFF/, "");
+function slugify(s: string) {
+  return (s || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "-")
+    .replace(/[^a-z0-9\-_]/g, "");
 }
 
+// Required headers: Pod optional, Country optional (Location OR Country must exist)
 function requiredColsMissing(headers: string[]) {
-  const required = ["Name", "Work Email", "Manager Email", "Team", "Location", "Photo URL"];
-  const set = new Set(headers.map(cleanHeader));
-  return required.filter((c) => !set.has(c));
-}
+  const baseRequired = ["Name", "Work Email", "Manager Email", "Team", "Photo URL"];
+  const set = new Set(headers);
 
-function parseCsvTextToRows(text: string): Promise<Row[]> {
-  return new Promise((resolve, reject) => {
-    Papa.parse<Row>(text, {
-      header: true,
-      skipEmptyLines: true,
-      transformHeader: cleanHeader,
-      complete: (res) => {
-        const headers = (res.meta.fields || []).map(cleanHeader);
-        const missing = requiredColsMissing(headers);
-        if (missing.length) {
-          reject(new Error(`Missing required columns: ${missing.join(", ")}`));
-          return;
-        }
+  const missingBase = baseRequired.filter((c) => !set.has(c));
 
-        const data = (res.data || []).filter(Boolean) as Row[];
+  const hasLocationOrCountry = set.has("Location") || set.has("Country");
+  const missingLocation = hasLocationOrCountry ? [] : ["Location (or Country)"];
 
-        // basic sanity check
-        const nonEmpty = data.filter((r) => String(r?.Name || "").trim());
-        if (!nonEmpty.length) {
-          reject(new Error("CSV parsed but no valid rows found (check Name column / file format)."));
-          return;
-        }
-
-        resolve(nonEmpty);
-      },
-      error: (err: unknown) => reject(err instanceof Error ? err : new Error(String(err))),
-    });
-  });
+  return [...missingBase, ...missingLocation];
 }
 
 export default function ClientPage() {
@@ -72,99 +53,132 @@ export default function ClientPage() {
   const [isEdit, setIsEdit] = useState(false);
   const [rows, setRows] = useState<Row[]>([]);
   const [error, setError] = useState<string>("");
-  const [loading, setLoading] = useState<boolean>(true);
 
-  // client-side only: read ?edit=1
+  // Determine edit mode from querystring (?edit=1) on client only
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     setIsEdit(params.get("edit") === "1");
   }, []);
 
-  // Load shared CSV from server on first load (view-only users included)
+  // Load shared CSV from server on first load (works for view-only users)
   useEffect(() => {
-    let cancelled = false;
-
-    (async () => {
-      setLoading(true);
-      setError("");
-
-      try {
-        const r = await fetch("/api/org", { cache: "no-store" });
-
-        // If no file uploaded yet, your API might return 404/204 — treat as empty state, not crash.
-        if (r.status === 404 || r.status === 204) {
-          if (!cancelled) setRows([]);
-          return;
-        }
-
-        if (!r.ok) {
-          const t = await r.text().catch(() => "");
-          throw new Error(t || `Failed to load /api/org (${r.status})`);
-        }
-
-        const text = await r.text();
-
-        // If server accidentally returns JSON error, detect early
-        if (!text.trim()) throw new Error("CSV is empty (server returned blank).");
-        if (text.trim().startsWith("{") || text.trim().startsWith("[")) {
-          throw new Error(`Server returned JSON instead of CSV: ${text.slice(0, 120)}...`);
-        }
-
-        const data = await parseCsvTextToRows(text);
-        if (!cancelled) setRows(data);
-      } catch (e: any) {
-        if (!cancelled) setError(e?.message || String(e));
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-    };
+    fetch("/api/org")
+      .then(async (r) => {
+        if (!r.ok) throw new Error(await r.text());
+        return r.text();
+      })
+      .then((text) => {
+        Papa.parse<Row>(text, {
+          header: true,
+          skipEmptyLines: true,
+          complete: (res) => setRows((res.data || []) as Row[]),
+          error: (err: unknown) =>
+            setError(err instanceof Error ? err.message : String(err)),
+        });
+      })
+      .catch(() => {
+        // normal on first run (no CSV uploaded yet)
+      });
   }, []);
 
   const nodes = useMemo(() => {
-    const built = rows.map((r, i) => {
-      const workEmail = String(r["Work Email"] || "").trim();
-      const mgrEmail = String(r["Manager Email"] || "").trim();
-      const name = String(r.Name || "").trim();
+    // 1) Build person nodes
+    const people = rows
+      .map((r, i) => {
+        const name = String((r as any)["Name"] ?? "").trim();
+        const workEmail = String((r as any)["Work Email"] ?? "").trim();
+        const managerEmail = String((r as any)["Manager Email"] ?? "").trim();
+        const team = String((r as any)["Team"] ?? "").trim();
+        const pod = String((r as any)["Pod"] ?? "").trim();
+        const country = String((r as any)["Country"] ?? (r as any)["Location"] ?? "").trim();
+        const photoRaw = String((r as any)["Photo URL"] ?? "").trim();
 
-      return {
-        id: workEmail ? normalizeEmail(workEmail) : `name:${name.toLowerCase()}:${i}`,
-        parentId: mgrEmail ? normalizeEmail(mgrEmail) : null,
-        name: name || workEmail || "(no name)",
-        email: workEmail,
-        team: String(r.Team || "").trim(),
-        pod: String(r.Pod || "").trim(),
-        location: String(r.Location || "").trim(),
-        photoUrl:
-          ensureHttps(String(r["Photo URL"] || "")) ||
-          `https://ui-avatars.com/api/?background=eee&color=555&name=${encodeURIComponent(
-            name || "User"
-          )}`,
-      };
+        // Skip totally empty rows (prevents d3-org-chart crash)
+        if (!name && !workEmail) return null;
+
+        const id =
+          workEmail ? normalizeEmail(workEmail) : `person:${slugify(name)}:${i}`;
+
+        const parentId = managerEmail ? normalizeEmail(managerEmail) : null;
+
+        return {
+          id,
+          parentId,
+          type: "person" as const,
+          name: name || workEmail || "(no name)",
+          email: workEmail,
+          team,
+          pod,
+          country,
+          photoUrl:
+            ensureHttps(photoRaw) ||
+            `https://ui-avatars.com/api/?background=eee&color=555&name=${encodeURIComponent(
+              name || "User"
+            )}`,
+        };
+      })
+      .filter(Boolean) as any[];
+
+    // Ensure unique IDs (duplicates can break chart)
+    const seen = new Map<string, number>();
+    for (const p of people) {
+      const count = (seen.get(p.id) || 0) + 1;
+      seen.set(p.id, count);
+      if (count > 1) p.id = `${p.id}__${count}`;
+    }
+
+    // 2) Fix parent references (if manager not found, treat as root)
+    const idSet = new Set(people.map((p) => p.id));
+    const normalizedPeople = people.map((p) => ({
+      ...p,
+      parentId: p.parentId && idSet.has(p.parentId) ? p.parentId : null,
+    }));
+
+    // 3) Pod grouping: create synthetic "pod" nodes under each manager
+    // For each person with a pod + has a manager, we:
+    // manager -> podNode -> person
+    const podNodes: any[] = [];
+    const podNodeIdByKey = new Map<string, string>();
+
+    function getPodNodeId(managerId: string | null, podName: string) {
+      const key = `${managerId || "root"}::${podName}`;
+      if (podNodeIdByKey.has(key)) return podNodeIdByKey.get(key)!;
+
+      const podId = `pod:${managerId || "root"}:${slugify(podName) || "unknown"}`;
+      podNodeIdByKey.set(key, podId);
+
+      podNodes.push({
+        id: podId,
+        parentId: managerId, // null for root-level pods
+        type: "pod" as const,
+        name: podName,
+      });
+
+      return podId;
+    }
+
+    const withPods = normalizedPeople.map((p) => {
+      const podName = String(p.pod || "").trim();
+      if (!podName) return p;
+
+      // group under pod node
+      const podId = getPodNodeId(p.parentId ?? null, podName);
+      return { ...p, parentId: podId };
     });
 
-    const ids = new Set(built.map((n) => n.id));
-    return built.map((n) => ({
-      ...n,
-      parentId: n.parentId && ids.has(n.parentId) ? n.parentId : null,
-    }));
+    return [...podNodes, ...withPods];
   }, [rows]);
 
-  // Render chart when nodes change
+  // Render chart whenever nodes change
   useEffect(() => {
     if (!chartRef.current) return;
 
-    // clear chart if no data
     if (!nodes.length) {
       chartRef.current.innerHTML = "";
       return;
     }
 
     chartRef.current.innerHTML = "";
-
     let cancelled = false;
 
     (async () => {
@@ -176,30 +190,45 @@ export default function ClientPage() {
       const chart = new OrgChart()
         .container(chartRef.current)
         .data(nodes)
-        .nodeWidth(() => 320)
-        .nodeHeight(() => 128)
+        .nodeWidth((d: any) => (d.data.type === "pod" ? 220 : 320))
+        .nodeHeight((d: any) => (d.data.type === "pod" ? 56 : 120))
         .childrenMargin(() => 50)
         .compactMarginBetween(() => 35)
         .compactMarginPair(() => 80)
         .nodeContent((d: any) => {
           const p = d.data;
 
+          // POD GROUP NODE (sanal node)
+          if (p.type === "pod") {
+            return `
+              <div style="
+                width:220px;height:56px;background:#F3F4F6;border:1px solid rgba(0,0,0,0.10);
+                border-radius:14px;display:flex;align-items:center;justify-content:center;
+                font-weight:900;font-size:14px;color:#111827;
+                box-shadow:0 2px 10px rgba(0,0,0,0.05);
+              ">
+                ${p.name}
+              </div>
+            `;
+          }
+
+          // PERSON NODE (sadece 4 satır: name, team, country, email)
           const img = p.photoUrl
             ? `<img src="${p.photoUrl}" crossorigin="anonymous"
                    style="width:64px;height:64px;border-radius:16px;object-fit:cover;border:1px solid rgba(0,0,0,0.12)" />`
             : `<div style="width:64px;height:64px;border-radius:16px;background:rgba(0,0,0,0.06);
-                   display:flex;align-items:center;justify-content:center;font-weight:800;">
+                   display:flex;align-items:center;justify-content:center;font-weight:900;">
                  ${String(p.name).trim().slice(0, 1).toUpperCase()}
                </div>`;
 
           return `
             <div style="
-              width:320px;height:128px;background:#fff;border:1px solid rgba(0,0,0,0.14);
+              width:320px;height:120px;background:#fff;border:1px solid rgba(0,0,0,0.14);
               border-radius:16px;box-shadow:0 4px 14px rgba(0,0,0,0.08);
               padding:12px;display:flex;gap:12px;align-items:center;
             ">
               ${img}
-              <div style="display:flex;flex-direction:column;gap:7px;min-width:0;flex:1;">
+              <div style="display:flex;flex-direction:column;gap:6px;min-width:0;flex:1;">
                 <div style="
                   font-weight:900;font-size:16px;line-height:1.15;color:#111827;
                   white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
@@ -207,45 +236,26 @@ export default function ClientPage() {
                   ${p.name}
                 </div>
 
-                <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
-                  ${
-                    p.team
-                      ? `<span style="
-                          font-size:12px;font-weight:850;color:#111827;
-                          background:#F3F4F6;border:1px solid rgba(0,0,0,0.08);
-                          padding:2px 8px;border-radius:999px;
-                          white-space:nowrap;max-width:220px;overflow:hidden;text-overflow:ellipsis;
-                        ">${p.team}</span>`
-                      : ""
-                  }
-
-                  ${
-                    p.pod
-                      ? `<span style="
-                          font-size:12px;font-weight:850;color:#1E3A8A;
-                          background:#EEF2FF;border:1px solid rgba(30,58,138,0.15);
-                          padding:2px 8px;border-radius:999px;
-                          white-space:nowrap;max-width:220px;overflow:hidden;text-overflow:ellipsis;
-                        ">${p.pod}</span>`
-                      : ""
-                  }
+                <div style="
+                  font-size:13px;font-weight:800;color:#111827;
+                  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+                ">
+                  ${p.team || ""}
                 </div>
 
-                ${
-                  p.location
-                    ? `<div style="font-size:12px;font-weight:700;color:#374151;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
-                        ${p.location}
-                      </div>`
-                    : ""
-                }
+                <div style="
+                  font-size:12px;font-weight:800;color:#374151;
+                  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+                ">
+                  ${p.country || ""}
+                </div>
 
-                ${
-                  p.email
-                    ? `<div style="font-size:11px;font-weight:700;color:#6B7280;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
-                        ${p.email}
-                      </div>`
-                    : ""
-                }
+                <div style="
+                  font-size:12px;font-weight:800;color:#6B7280;
+                  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+                ">
+                  ${p.email || ""}
+                </div>
               </div>
             </div>
           `;
@@ -253,8 +263,6 @@ export default function ClientPage() {
         .render();
 
       chartObjRef.current = chart;
-      // nice default view
-      chartObjRef.current?.fit?.();
     })();
 
     return () => {
@@ -267,6 +275,16 @@ export default function ClientPage() {
 
     const pw = prompt("Admin password?");
     if (!pw) return;
+
+    // (Optional) quick header validation before upload
+    const text = await file.text();
+    const parsed = Papa.parse(text, { header: true, skipEmptyLines: true });
+    const headers = ((parsed as any).meta?.fields || []) as string[];
+    const missing = requiredColsMissing(headers);
+    if (missing.length) {
+      setError(`Missing required columns: ${missing.join(", ")}`);
+      return;
+    }
 
     const fd = new FormData();
     fd.append("file", file);
@@ -283,15 +301,14 @@ export default function ClientPage() {
     }
 
     // Reload from shared source
-    try {
-      const r = await fetch("/api/org", { cache: "no-store" });
-      if (!r.ok) throw new Error(await r.text());
-      const csv = await r.text();
-      const data = await parseCsvTextToRows(csv);
-      setRows(data);
-    } catch (e: any) {
-      setError(e?.message || String(e));
-    }
+    const csv = await (await fetch("/api/org")).text();
+    Papa.parse<Row>(csv, {
+      header: true,
+      skipEmptyLines: true,
+      complete: (r) => setRows((r.data || []) as Row[]),
+      error: (err: unknown) =>
+        setError(err instanceof Error ? err.message : String(err)),
+    });
   }
 
   return (
@@ -326,8 +343,6 @@ export default function ClientPage() {
         <button onClick={() => chartObjRef.current?.collapseAll()} style={{ padding: "8px 12px" }}>
           Collapse
         </button>
-
-        {loading ? <span style={{ marginLeft: 8, opacity: 0.7 }}>Loading…</span> : null}
       </div>
 
       {error ? (
@@ -345,15 +360,10 @@ export default function ClientPage() {
         }}
       >
         <div ref={chartRef} />
-        {!loading && !nodes.length && !error ? (
-          <div style={{ padding: 16, opacity: 0.7 }}>
-            No data yet. Upload a CSV (edit mode) or check that /api/org has a CSV stored.
-          </div>
-        ) : null}
       </div>
 
       <div style={{ marginTop: 10, opacity: 0.7, fontSize: 12 }}>
-        CSV headers expected: Name, Work Email, Manager Email, Team, Location, Photo URL (optional: Pod)
+        CSV headers expected: Name, Work Email, Manager Email, Team, Photo URL, Location (or Country), optional: Pod
       </div>
     </div>
   );
