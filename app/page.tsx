@@ -9,12 +9,20 @@ type Row = {
   "Manager Email": string;
   Team: string;
   Pod?: string;
-  Location: string; // country burada
+  Location: string;
   "Photo URL": string;
 };
 
 function normalizeEmail(v: string) {
   return (v || "").trim().toLowerCase();
+}
+
+function normalizePod(v: string) {
+  // normalize quotes/spaces/case a bit so FO variations don't split pods
+  return (v || "")
+    .trim()
+    .replace(/[’]/g, "'")
+    .replace(/\s+/g, " ");
 }
 
 function ensureHttps(url: string) {
@@ -24,49 +32,22 @@ function ensureHttps(url: string) {
   return `https://${u}`;
 }
 
-/** Pod tekilleştirme (FO / Founder’s Office vs.) */
-function normalizePod(podRaw: string) {
-  const p = (podRaw || "")
-    .trim()
-    .replace(/\s+/g, " ")
-    .replace(/[’‘]/g, "'"); // apostrophe normalize
-
-  if (!p) return "";
-
-  const key = p.toLowerCase();
-
-  // burada mapping’i istediğin gibi büyütebilirsin
-  const map: Record<string, string> = {
-    "fo": "Founder's Office",
-    "founders office": "Founder's Office",
-    "founder's office": "Founder's Office",
-    "founder’s office": "Founder's Office",
-    "cx": "CX",
-    "qa eng.": "QA Eng.",
-  };
-
-  return map[key] ?? p;
+function requiredColsMissing(headers: string[]) {
+  const required = ["Name", "Work Email", "Manager Email", "Team", "Location", "Photo URL"];
+  const set = new Set(headers);
+  return required.filter((c) => !set.has(c));
 }
 
-/** Pod’a göre renk (deterministic) */
-function hashToIndex(s: string, mod: number) {
-  let h = 0;
-  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
-  return mod ? h % mod : 0;
-}
-
-const POD_COLORS = [
-  { border: "#2563EB", bg: "#EFF6FF" }, // blue
-  { border: "#7C3AED", bg: "#F5F3FF" }, // purple
-  { border: "#059669", bg: "#ECFDF5" }, // green
-  { border: "#DC2626", bg: "#FEF2F2" }, // red
-  { border: "#EA580C", bg: "#FFF7ED" }, // orange
-  { border: "#0F766E", bg: "#F0FDFA" }, // teal
-  { border: "#4F46E5", bg: "#EEF2FF" }, // indigo
-  { border: "#B45309", bg: "#FFFBEB" }, // amber
-  { border: "#BE185D", bg: "#FDF2F8" }, // pink
-  { border: "#374151", bg: "#F9FAFB" }, // gray
-];
+type NodeT = {
+  id: string;
+  parentId: string | null;
+  name: string;
+  email: string;
+  team: string;
+  pod: string;
+  location: string;
+  photoUrl: string;
+};
 
 export default function ClientPage() {
   const chartRef = useRef<HTMLDivElement | null>(null);
@@ -76,13 +57,15 @@ export default function ClientPage() {
   const [rows, setRows] = useState<Row[]>([]);
   const [error, setError] = useState<string>("");
 
-  // edit mode only by ?edit=1
+  // layout toggle
+  const [viewMode, setViewMode] = useState<"hierarchy" | "pod">("hierarchy");
+
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     setIsEdit(params.get("edit") === "1");
   }, []);
 
-  // Load shared CSV
+  // Load shared CSV from server on first load
   useEffect(() => {
     fetch("/api/org")
       .then(async (r) => {
@@ -99,29 +82,23 @@ export default function ClientPage() {
         });
       })
       .catch(() => {
-        // first run: no CSV yet
+        // first run: no CSV uploaded yet
       });
   }, []);
 
-  const nodes = useMemo(() => {
-    const built = rows.map((r, i) => {
+  const nodes: NodeT[] = useMemo(() => {
+    const built: NodeT[] = rows.map((r, i) => {
       const workEmail = String(r["Work Email"] || "").trim();
       const name = String(r.Name || "").trim();
-
       const pod = normalizePod(String(r.Pod || ""));
-      const podColor =
-        pod ? POD_COLORS[hashToIndex(pod, POD_COLORS.length)] : null;
 
       return {
         id: workEmail ? normalizeEmail(workEmail) : `name:${name.toLowerCase()}:${i}`,
         parentId: normalizeEmail(r["Manager Email"]) || null,
-
         name: name || workEmail || "(no name)",
         email: workEmail,
         team: String(r.Team || "").trim(),
         pod,
-        podBorder: podColor?.border || "#E5E7EB",
-        podBg: podColor?.bg || "#FFFFFF",
         location: String(r.Location || "").trim(),
         photoUrl:
           ensureHttps(r["Photo URL"] || "") ||
@@ -131,7 +108,6 @@ export default function ClientPage() {
       };
     });
 
-    // if manager not in set, make root
     const ids = new Set(built.map((n) => n.id));
     return built.map((n) => ({
       ...n,
@@ -139,7 +115,7 @@ export default function ClientPage() {
     }));
   }, [rows]);
 
-  // Render chart
+  // Render chart when nodes change
   useEffect(() => {
     if (!chartRef.current) return;
 
@@ -149,93 +125,98 @@ export default function ClientPage() {
     }
 
     chartRef.current.innerHTML = "";
+
     let cancelled = false;
 
     (async () => {
       const mod = await import("d3-org-chart");
       const OrgChart = (mod as any).OrgChart;
+
       if (cancelled || !chartRef.current) return;
+
+      const LILA = "#7C3AED";
+      const LILA_BG = "#F5F3FF";
+      const LILA_BADGE_BG = "#EDE9FE";
+      const TEXT_DARK = "#111827";
+      const TEXT_MID = "#374151";
+      const TEXT_LIGHT = "#6B7280";
 
       const chart = new OrgChart()
         .container(chartRef.current)
         .data(nodes)
-        .nodeWidth(() => 340)
-        .nodeHeight(() => 120)
-        .childrenMargin(() => 55)
+        .nodeWidth(() => (viewMode === "pod" ? 340 : 320))
+        .nodeHeight(() => 110)
+        .childrenMargin(() => 50)
         .compactMarginBetween(() => 35)
         .compactMarginPair(() => 80)
+        .compact(viewMode === "pod") // pod mode is a bit more compact, feels grouped
+        .nodeSort((a: any, b: any) => {
+          // IMPORTANT: hierarchy stays same; we only sort siblings-ish by pod+name
+          if (viewMode !== "pod") return 0;
+          const pa = String(a.data.pod || "").toLowerCase();
+          const pb = String(b.data.pod || "").toLowerCase();
+          if (pa < pb) return -1;
+          if (pa > pb) return 1;
+          const na = String(a.data.name || "").toLowerCase();
+          const nb = String(b.data.name || "").toLowerCase();
+          return na.localeCompare(nb);
+        })
         .nodeContent((d: any) => {
-          const p = d.data;
+          const p: NodeT = d.data;
 
           const img = p.photoUrl
             ? `<img src="${p.photoUrl}" crossorigin="anonymous"
-                 style="width:64px;height:64px;border-radius:16px;object-fit:cover;border:1px solid rgba(0,0,0,0.12)" />`
+                 style="width:64px;height:64px;border-radius:16px;object-fit:cover;border:1px solid rgba(0,0,0,0.10)" />`
             : `<div style="width:64px;height:64px;border-radius:16px;background:rgba(0,0,0,0.06);
-                 display:flex;align-items:center;justify-content:center;font-weight:800;">
+                 display:flex;align-items:center;justify-content:center;font-weight:800;color:${TEXT_DARK};">
                ${String(p.name).trim().slice(0, 1).toUpperCase()}
              </div>`;
 
-          // ONLY: Name / Team / Country(Location) / Email
-          // Pod: small badge (does not replace team)
+          // Pod badge: top-right, doesn't add a new "line"
+          const podBadge = p.pod
+            ? `<div style="
+                position:absolute;top:10px;right:12px;
+                font-size:11px;font-weight:800;color:${LILA};
+                background:${LILA_BADGE_BG};
+                border:1px solid rgba(124,58,237,0.18);
+                padding:2px 8px;border-radius:999px;
+                max-width:140px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+              ">${p.pod}</div>`
+            : "";
+
           return `
             <div style="
-              width:340px;height:120px;
-              background:${p.podBg};
-              border:1px solid rgba(0,0,0,0.12);
-              border-left:8px solid ${p.podBorder};
+              width:${viewMode === "pod" ? 340 : 320}px;height:110px;
+              background:${LILA_BG};
+              border:1px solid rgba(0,0,0,0.10);
+              border-left:6px solid ${LILA};
               border-radius:16px;
-              box-shadow:0 4px 14px rgba(0,0,0,0.08);
-              padding:12px;
-              display:flex;gap:12px;align-items:center;
+              box-shadow:0 3px 14px rgba(0,0,0,0.06);
+              padding:12px;display:flex;gap:12px;align-items:center;
+              position:relative;
             ">
+              ${podBadge}
               ${img}
-
-              <div style="display:flex;flex-direction:column;gap:6px;min-width:0;flex:1;">
+              <div style="display:flex;flex-direction:column;gap:6px;min-width:0;flex:1;padding-right:8px;">
                 <div style="
-                  display:flex;align-items:center;justify-content:space-between;gap:8px;
-                  min-width:0;
-                ">
-                  <div style="
-                    font-weight:900;font-size:16px;line-height:1.15;color:#111827;
-                    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-                    min-width:0;
-                  ">
-                    ${p.name}
-                  </div>
-
-                  ${
-                    p.pod
-                      ? `<span style="
-                          font-size:11px;font-weight:900;color:${p.podBorder};
-                          background:#FFFFFFCC;
-                          border:1px solid ${p.podBorder}33;
-                          padding:2px 8px;border-radius:999px;
-                          white-space:nowrap;
-                        ">${p.pod}</span>`
-                      : ""
-                  }
-                </div>
-
-                <div style="
-                  font-size:13px;font-weight:800;color:#111827;
+                  font-weight:900;font-size:15px;line-height:1.1;color:${TEXT_DARK};
                   white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-                ">
-                  ${p.team || ""}
-                </div>
+                ">${p.name}</div>
 
                 <div style="
-                  font-size:12px;font-weight:800;color:#374151;
+                  font-size:12px;font-weight:800;color:${TEXT_DARK};
                   white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-                ">
-                  ${p.location || ""}
-                </div>
+                ">${p.team}</div>
 
                 <div style="
-                  font-size:12px;font-weight:800;color:#6B7280;
+                  font-size:12px;font-weight:700;color:${TEXT_MID};
                   white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-                ">
-                  ${p.email || ""}
-                </div>
+                ">${p.location}</div>
+
+                <div style="
+                  font-size:11px;font-weight:700;color:${TEXT_LIGHT};
+                  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+                ">${p.email}</div>
               </div>
             </div>
           `;
@@ -248,7 +229,7 @@ export default function ClientPage() {
     return () => {
       cancelled = true;
     };
-  }, [nodes]);
+  }, [nodes, viewMode]);
 
   async function uploadCsvToServer(file: File) {
     setError("");
@@ -286,7 +267,7 @@ export default function ClientPage() {
         Aspora Organisational Chart
       </h1>
 
-      <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 12 }}>
+      <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 12, flexWrap: "wrap" }}>
         {isEdit && (
           <input
             type="file"
@@ -311,6 +292,15 @@ export default function ClientPage() {
         </button>
         <button onClick={() => chartObjRef.current?.collapseAll()} style={{ padding: "8px 12px" }}>
           Collapse
+        </button>
+
+        <div style={{ width: 1, height: 26, background: "rgba(0,0,0,0.15)", margin: "0 6px" }} />
+
+        <button
+          onClick={() => setViewMode((v) => (v === "hierarchy" ? "pod" : "hierarchy"))}
+          style={{ padding: "8px 12px", fontWeight: 800 }}
+        >
+          Layout: {viewMode === "hierarchy" ? "Hierarchy" : "Pod"}
         </button>
       </div>
 
