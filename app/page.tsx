@@ -5,26 +5,35 @@ import Papa from "papaparse";
 
 type RawRow = Record<string, string>;
 
-type PersonNode = {
+type Row = {
+  name: string;
+  workEmail: string;
+  managerEmail: string;
+  team: string;
+  location: string;
+  photoUrl: string;
+  pod: string;
+};
+
+type NodeData = {
   id: string;
   parentId: string | null;
-  isPod?: false;
+
   name: string;
   email: string;
   team: string;
   location: string;
   photoUrl: string;
-  pod: string; // "" olabilir
-};
+  pod: string;
 
-type PodNode = {
-  id: string; // "pod:Engineering"
-  parentId: string; // root id
-  isPod: true;
-  name: string; // Pod adı
-};
+  isPod?: boolean;
+  // for pod nodes
+  podKey?: string;
+  podTotal?: number;
 
-type ChartNode = PersonNode | PodNode;
+  // org-chart internal toggles (works in d3-org-chart)
+  _expanded?: boolean;
+};
 
 function normalizeEmail(v: string) {
   return (v || "").trim().toLowerCase();
@@ -37,41 +46,68 @@ function ensureHttps(url: string) {
   return `https://${u}`;
 }
 
-// CSV header alias (senin dosyada bazen değişiyor)
+/**
+ * CSV header aliases:
+ * - Name
+ * - Work Email
+ * - Manager Email
+ * - Team
+ * - Location
+ * - Photo URL
+ * - Pod (optional but supported)
+ *
+ * Senin sheet’te bazen şu kolonlar da olabiliyor:
+ * - Job Title (biz kullanmıyoruz)
+ * - Manager Name (biz kullanmıyoruz)
+ */
 function pick(row: RawRow, keys: string[]) {
   for (const k of keys) {
-    const v = row[k];
-    if (v !== undefined) return v;
+    if (row[k] != null && String(row[k]).trim() !== "") return String(row[k]);
   }
   return "";
 }
 
-function requiredColsMissing(headers: string[]) {
-  // Pod opsiyonel
-  const required = ["Name", "Work Email", "Manager Email", "Team", "Location", "Photo URL"];
-  const set = new Set(headers);
-  return required.filter((c) => !set.has(c));
+function parseRows(raw: RawRow[]): Row[] {
+  return raw.map((r) => {
+    const name = pick(r, ["Name"]).trim();
+    const workEmail = pick(r, ["Work Email", "Work email", "Email", "WorkEmail"]).trim();
+    const managerEmail = pick(r, ["Manager Email", "Manager email", "ManagerEmail"]).trim();
+    const team = pick(r, ["Team"]).trim();
+    const location = pick(r, ["Location", "Country"]).trim();
+    const photoUrl = pick(r, ["Photo URL", "Photo Url", "Photo", "Avatar"]).trim();
+    const pod = pick(r, ["Pod", "POD"]).trim();
+
+    return {
+      name,
+      workEmail,
+      managerEmail,
+      team,
+      location,
+      photoUrl,
+      pod,
+    };
+  });
 }
 
-type ViewMode = "hierarchy" | "pod";
+const LILAC = "#6D28D9";
+const LILAC_BG = "#F5F3FF";
 
-export default function ClientPage() {
+export default function Page() {
   const chartRef = useRef<HTMLDivElement | null>(null);
   const chartObjRef = useRef<any>(null);
 
   const [isEdit, setIsEdit] = useState(false);
-  const [viewMode, setViewMode] = useState<ViewMode>("hierarchy");
+  const [layout, setLayout] = useState<"hierarchy" | "pod">("hierarchy");
+  const [rows, setRows] = useState<Row[]>([]);
+  const [error, setError] = useState("");
 
-  const [rows, setRows] = useState<RawRow[]>([]);
-  const [error, setError] = useState<string>("");
-
-  // edit=1 sadece sende
+  // edit mode: ?edit=1
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     setIsEdit(params.get("edit") === "1");
   }, []);
 
-  // shared CSV load
+  // load CSV from /api/org
   useEffect(() => {
     fetch("/api/org")
       .then(async (r) => {
@@ -82,151 +118,184 @@ export default function ClientPage() {
         Papa.parse<RawRow>(text, {
           header: true,
           skipEmptyLines: true,
-          complete: (res) => setRows((res.data || []) as RawRow[]),
-          error: (err: unknown) => setError(err instanceof Error ? err.message : String(err)),
+          complete: (res) => {
+            const raw = (res.data || []) as RawRow[];
+            const parsed = parseRows(raw);
+
+            // basic validation: Name required
+            const badIdx = parsed.findIndex((x) => !x.name);
+            if (badIdx >= 0) {
+              setError(`Row ${badIdx + 2} has empty values for: Name`);
+              return;
+            }
+
+            setError("");
+            setRows(parsed);
+          },
+          error: (err: unknown) =>
+            setError(err instanceof Error ? err.message : String(err)),
         });
       })
       .catch(() => {
-        // ilk kurulumda normal: csv yoksa sessiz geç
+        // no CSV uploaded yet
       });
   }, []);
 
-  // people nodes (her zaman temel kaynak)
-  const people: PersonNode[] = useMemo(() => {
-    return rows
-      .filter((r) => Object.keys(r || {}).length > 0)
-      .map((r, i) => {
-        const name = String(pick(r, ["Name"])).trim();
-        const email = String(pick(r, ["Work Email", "Email", "Work email"])).trim();
-        const managerEmail = String(pick(r, ["Manager Email", "Manager email"])).trim();
+  // base hierarchy nodes (no pod grouping)
+  const baseNodes = useMemo<NodeData[]>(() => {
+    const built: NodeData[] = rows.map((r, i) => {
+      const email = normalizeEmail(r.workEmail);
+      const name = (r.name || "").trim();
 
-        const team = String(pick(r, ["Team"])).trim();
-        const location = String(pick(r, ["Location", "Country"])).trim();
+      const id = email ? email : `name:${name.toLowerCase()}:${i}`;
+      const parentId = normalizeEmail(r.managerEmail) || null;
 
-        // Pod OPSİYONEL: sadece Pod kolonundan
-        const pod = String(pick(r, ["Pod"])).trim();
+      return {
+        id,
+        parentId,
+        name: name || r.workEmail || "(no name)",
+        email: r.workEmail || "",
+        team: r.team || "",
+        location: r.location || "",
+        pod: r.pod || "",
+        photoUrl:
+          ensureHttps(r.photoUrl) ||
+          `https://ui-avatars.com/api/?background=eee&color=555&name=${encodeURIComponent(
+            name || "User"
+          )}`,
+      };
+    });
 
-        const photo = String(pick(r, ["Photo URL", "Photo Url", "Photo"])).trim();
-
-        const id = email ? normalizeEmail(email) : `name:${name.toLowerCase()}:${i}`;
-
-        return {
-          id,
-          parentId: normalizeEmail(managerEmail) || null,
-          isPod: false,
-          name: name || email || "(no name)",
-          email,
-          team,
-          location,
-          pod,
-          photoUrl:
-            ensureHttps(photo) ||
-            `https://ui-avatars.com/api/?background=eee&color=555&name=${encodeURIComponent(
-              name || "User"
-            )}`,
-        };
-      });
+    // If manager email not in dataset -> parentId null
+    const ids = new Set(built.map((n) => n.id));
+    return built.map((n) => ({
+      ...n,
+      parentId: n.parentId && ids.has(n.parentId) ? n.parentId : null,
+    }));
   }, [rows]);
 
-  // manager olmayanları root say (dataset dışı manager varsa da root olsun)
-  const normalizedPeople: PersonNode[] = useMemo(() => {
-    const ids = new Set(people.map((p) => p.id));
-    return people.map((p) => ({
-      ...p,
-      parentId: p.parentId && ids.has(p.parentId) ? p.parentId : null,
-    }));
-  }, [people]);
+  // helper: find single root; if multiple roots create a super root
+  const { hierarchyRootId, hierarchyNodesNormalized } = useMemo(() => {
+    if (!baseNodes.length) return { hierarchyRootId: "", hierarchyNodesNormalized: [] as NodeData[] };
 
-  // pod -> person id list (pod view expand için)
-  const idsByPod = useMemo(() => {
-    const map = new Map<string, string[]>();
-    for (const p of normalizedPeople) {
-      if (!p.pod) continue;
-      if (!map.has(p.pod)) map.set(p.pod, []);
-      map.get(p.pod)!.push(p.id);
-    }
-    return map;
-  }, [normalizedPeople]);
-
-  // root belirle (1'den fazla root varsa super-root oluştur)
-  const { rootId, hierarchyNodes } = useMemo(() => {
-    const roots = normalizedPeople.filter((p) => p.parentId === null);
-    if (roots.length <= 1) {
-      return { rootId: roots[0]?.id || null, hierarchyNodes: normalizedPeople as ChartNode[] };
+    const roots = baseNodes.filter((n) => !n.parentId);
+    if (roots.length === 1) {
+      return { hierarchyRootId: roots[0].id, hierarchyNodesNormalized: baseNodes };
     }
 
     const superRootId = "__root__";
-    const superRoot: PersonNode = {
+    const superRoot: NodeData = {
       id: superRootId,
       parentId: null,
-      isPod: false,
       name: "Aspora",
       email: "",
       team: "",
       location: "",
       pod: "",
-      photoUrl: `https://ui-avatars.com/api/?background=eee&color=555&name=${encodeURIComponent("Aspora")}`,
+      photoUrl: `https://ui-avatars.com/api/?background=eee&color=555&name=${encodeURIComponent(
+        "Aspora"
+      )}`,
     };
 
-    const patched = normalizedPeople.map((p) =>
-      p.parentId === null ? { ...p, parentId: superRootId } : p
-    );
+    const rewired = baseNodes.map((n) => (n.parentId ? n : { ...n, parentId: superRootId }));
+    return { hierarchyRootId: superRootId, hierarchyNodesNormalized: [superRoot, ...rewired] };
+  }, [baseNodes]);
 
-    return { rootId: superRootId, hierarchyNodes: [superRoot, ...patched] as ChartNode[] };
-  }, [normalizedPeople]);
+  /**
+   * POD VIEW:
+   * - Pod nodes are children of the root.
+   * - A person attaches to:
+   *   - their manager if manager is in same pod
+   *   - otherwise attaches to the pod node
+   * This preserves hierarchy INSIDE the pod but groups by pod at top.
+   * Also:
+   * - NO "No Pod" node: we skip empty pod values.
+   * - podTotal counts ALL people in that pod (not just direct children).
+   */
+  const podNodes = useMemo<NodeData[]>(() => {
+    if (!hierarchyNodesNormalized.length) return [];
 
-  // POD VIEW node set üretimi
-  const podNodes: ChartNode[] = useMemo(() => {
-    if (viewMode !== "pod") return hierarchyNodes;
+    const rootId = hierarchyRootId;
 
-    if (!rootId) return hierarchyNodes;
+    // Only consider people nodes (exclude super root etc) as "non-pod nodes"
+    const people = hierarchyNodesNormalized.filter((n) => !n.isPod && n.id !== "__root__");
 
-    // pod node’larını üret (pod boşsa üretme!)
-    const pods = Array.from(idsByPod.keys()).sort((a, b) => a.localeCompare(b));
-    const podGroupNodes: PodNode[] = pods.map((pod) => ({
-      id: `pod:${pod}`,
-      parentId: rootId,
-      isPod: true,
-      name: pod,
-    }));
-
-    // hızlı lookup
-    const byId = new Map<string, PersonNode>();
-    for (const n of hierarchyNodes) {
-      if ((n as any).isPod) continue;
-      byId.set((n as PersonNode).id, n as PersonNode);
+    // map person id -> pod key
+    const podOf = new Map<string, string>();
+    for (const p of people) {
+      const key = (p.pod || "").trim();
+      podOf.set(p.id, key);
     }
 
-    // Pod view parent rule:
-    // - podu olan kişi:
-    //    - manager yoksa -> pod node altına
-    //    - manager farklı pod / yok -> pod node altına
-    //    - manager aynı pod -> manager’a bağlı kalsın
-    // - podu olmayan: normal hiyerarşi kalsın (No Pod yok!)
-    const patchedPeople: PersonNode[] = (hierarchyNodes as PersonNode[]).filter(
-      (n) => !(n as any).isPod
-    ).map((p) => {
-      if (!p.pod) return p;
+    // build unique pods (non-empty only)
+    const pods = Array.from(
+      new Set(
+        people
+          .map((p) => (p.pod || "").trim())
+          .filter((x) => x.length > 0)
+      )
+    ).sort((a, b) => a.localeCompare(b));
 
-      const mgr = p.parentId ? byId.get(p.parentId) : null;
-      const mgrPod = mgr?.pod || "";
+    // pod totals: total people per pod
+    const podTotals = new Map<string, number>();
+    for (const p of people) {
+      const key = (p.pod || "").trim();
+      if (!key) continue;
+      podTotals.set(key, (podTotals.get(key) || 0) + 1);
+    }
 
-      if (!mgr || mgrPod !== p.pod) {
-        return { ...p, parentId: `pod:${p.pod}` };
+    // create pod nodes under root
+    const podHeaderNodes: NodeData[] = pods.map((pod) => ({
+      id: `pod:${pod.toLowerCase()}`,
+      parentId: rootId,
+      name: pod,
+      email: "",
+      team: "",
+      location: "",
+      pod,
+      photoUrl: "",
+      isPod: true,
+      podKey: pod,
+      podTotal: podTotals.get(pod) || 0,
+      _expanded: false,
+    }));
+
+    // rewrite parentId for people nodes according to rule
+    const peopleRewired: NodeData[] = people.map((p) => {
+      const myPod = (p.pod || "").trim();
+      if (!myPod) {
+        // pod empty => keep original hierarchy (no pod grouping)
+        return { ...p };
       }
-      return p;
+
+      const mgrId = p.parentId;
+      if (mgrId && (podOf.get(mgrId) || "").trim() === myPod) {
+        // manager same pod => keep manager relationship
+        return { ...p };
+      }
+
+      // manager different pod or null => attach to pod node
+      return { ...p, parentId: `pod:${myPod.toLowerCase()}` };
     });
 
-    // root kişinin kendi pod’u varsa bile root’u bozma:
-    // (root CEO, pod node'lar zaten root altında)
-    // root kişi patchedPeople içinde kalıyor.
+    // Also include root/super root nodes as-is (but not duplicated)
+    const nonPeople = hierarchyNodesNormalized.filter((n) => !people.some((p) => p.id === n.id));
+    const combined = [...nonPeople, ...podHeaderNodes, ...peopleRewired];
 
-    return [...podGroupNodes, ...patchedPeople] as ChartNode[];
-  }, [viewMode, hierarchyNodes, idsByPod, rootId]);
+    // Ensure parentId references exist
+    const ids = new Set(combined.map((n) => n.id));
+    return combined.map((n) => ({
+      ...n,
+      parentId: n.parentId && ids.has(n.parentId) ? n.parentId : null,
+    }));
+  }, [hierarchyNodesNormalized, hierarchyRootId]);
 
-  // Upload
+  const activeNodes = layout === "pod" ? podNodes : hierarchyNodesNormalized;
+
+  // Upload CSV (edit only)
   async function uploadCsvToServer(file: File) {
     setError("");
+
     const pw = prompt("Admin password?");
     if (!pw) return;
 
@@ -244,11 +313,15 @@ export default function ClientPage() {
       return;
     }
 
+    // reload
     const csv = await (await fetch("/api/org")).text();
     Papa.parse<RawRow>(csv, {
       header: true,
       skipEmptyLines: true,
-      complete: (r) => setRows((r.data || []) as RawRow[]),
+      complete: (r) => {
+        const parsed = parseRows((r.data || []) as RawRow[]);
+        setRows(parsed);
+      },
       error: (err: unknown) => setError(err instanceof Error ? err.message : String(err)),
     });
   }
@@ -257,14 +330,13 @@ export default function ClientPage() {
   useEffect(() => {
     if (!chartRef.current) return;
 
-    if (!podNodes.length) {
+    if (!activeNodes.length) {
       chartRef.current.innerHTML = "";
       return;
     }
 
-    chartRef.current.innerHTML = "";
-
     let cancelled = false;
+    chartRef.current.innerHTML = "";
 
     (async () => {
       const mod = await import("d3-org-chart");
@@ -272,107 +344,130 @@ export default function ClientPage() {
 
       if (cancelled || !chartRef.current) return;
 
-      const LILAC = "#6D28D9";
-      const LILAC_BG = "#F5F3FF";
-
       const chart = new OrgChart()
         .container(chartRef.current)
-        .data(podNodes)
-        .nodeWidth(() => (viewMode === "pod" ? 340 : 320))
-        .nodeHeight(() => (viewMode === "pod" ? 90 : 120))
-        .childrenMargin(() => 50)
-        .compactMarginBetween(() => 35)
-        .compactMarginPair(() => 80)
-        .onNodeClick((d: any) => {
-          const data = d?.data as ChartNode;
+        .data(activeNodes)
+        .nodeWidth(() => 360)
+        // IMPORTANT: extra height to prevent button badge overlapping text
+        .nodeHeight((d: any) => (d.data?.isPod ? 110 : 160))
+        .childrenMargin(() => 60)
+        .compactMarginBetween(() => 40)
+        .compactMarginPair(() => 90)
+        // Custom expand/collapse button content:
+        // - pod nodes show TOTAL people in pod
+        // - others default behavior
+        .nodeButtonContent((d: any) => {
+          const isPod = !!d.data?.isPod;
+          const total = isPod ? Number(d.data?.podTotal || 0) : null;
 
-          // Pod node’a tıklayınca: o pod’un altındaki HER ŞEY tek seferde açılsın/kapanılsın
-          if (data?.isPod) {
-            const podName = data.name;
-            const ids = idsByPod.get(podName) || [];
-            const isExpanded = !!d?.data?._expanded;
+          // d3-org-chart passes "d" with children info; fallback to descendants count if available
+          const defaultCount =
+            typeof d?.childrenCount === "number"
+              ? d.childrenCount
+              : Array.isArray(d?.children)
+              ? d.children.length
+              : 0;
 
-            const c = chart as any;
+          const countToShow = isPod ? total : defaultCount;
 
-            const safeSet = (id: string, val: boolean) => {
-              if (typeof c.setExpanded === "function") c.setExpanded(id, val);
-            };
+          // show nothing if 0
+          if (!countToShow) return "";
 
-            // toggle
-            safeSet(data.id, !isExpanded);
-
-            // pod açılıyorsa: pod içindeki herkes expand olsun
-            if (!isExpanded) {
-              for (const id of ids) safeSet(id, true);
-            } else {
-              // pod kapanıyorsa: pod içindeki herkes collapse olsun
-              for (const id of ids) safeSet(id, false);
-            }
-
-            if (typeof c.render === "function") c.render();
-            if (typeof c.fit === "function") c.fit();
-          }
+          return `
+            <div style="
+              background:#fff;border:1px solid rgba(0,0,0,0.15);
+              border-radius:8px;padding:2px 7px;
+              font-size:12px;font-weight:800;color:#111827;
+              box-shadow:0 1px 6px rgba(0,0,0,0.06);
+              transform: translateY(8px); /* push badge slightly down */
+            ">
+              ${countToShow}
+            </div>
+          `;
         })
         .nodeContent((d: any) => {
-          const p = d.data as ChartNode;
+          const p: NodeData = d.data;
 
-          // POD NODE (no "x people" text)
-          if ((p as any).isPod) {
+          // POD NODE
+          if (p.isPod) {
             return `
               <div style="
-                width:340px;height:90px;background:${LILAC_BG};
-                border:1px solid rgba(0,0,0,0.10);
-                border-radius:18px;box-shadow:0 6px 18px rgba(0,0,0,0.06);
+                width:360px;height:110px;
                 display:flex;align-items:center;justify-content:center;
-                position:relative; overflow:hidden;
               ">
-                <div style="position:absolute;left:0;top:0;bottom:0;width:6px;background:${LILAC};"></div>
                 <div style="
-                  font-weight:900;font-size:18px;color:#111827;
-                  padding:0 16px; text-align:center;
-                  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:320px;
+                  width:360px;height:90px;background:${LILAC_BG};
+                  border:1px solid rgba(0,0,0,0.10);
+                  border-radius:18px;
+                  box-shadow:0 6px 18px rgba(0,0,0,0.06);
+                  display:flex;align-items:center;justify-content:center;
+                  position:relative; overflow:hidden;
                 ">
-                  ${(p as PodNode).name}
+                  <div style="position:absolute;left:0;top:0;bottom:0;width:7px;background:${LILAC};"></div>
+                  <div style="
+                    font-weight:900;font-size:20px;color:#111827;
+                    padding:0 16px; text-align:center;
+                    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:330px;
+                  ">
+                    ${p.name}
+                  </div>
                 </div>
               </div>
             `;
           }
 
-          const person = p as PersonNode;
-
-          const img = person.photoUrl
-            ? `<img src="${person.photoUrl}" crossorigin="anonymous"
+          // PERSON NODE
+          const img = p.photoUrl
+            ? `<img src="${p.photoUrl}" crossorigin="anonymous"
                  style="width:64px;height:64px;border-radius:16px;object-fit:cover;border:1px solid rgba(0,0,0,0.12)" />`
             : `<div style="width:64px;height:64px;border-radius:16px;background:rgba(0,0,0,0.06);
-                 display:flex;align-items:center;justify-content:center;font-weight:700;">
-                 ${String(person.name).trim().slice(0, 1).toUpperCase()}
+                 display:flex;align-items:center;justify-content:center;font-weight:900;">
+                 ${String(p.name).trim().slice(0, 1).toUpperCase()}
                </div>`;
 
-          // Sadece: Name / Team / Location / Email
+          // Reserve bottom space for badge: outer 160px, inner card 135px
           return `
-            <div style="
-              width:320px;height:120px;background:#fff;border:1px solid rgba(0,0,0,0.12);
-              border-radius:16px;box-shadow:0 2px 10px rgba(0,0,0,0.06);
-              padding:12px;display:flex;gap:12px;align-items:center;
-              position:relative; overflow:hidden;
-            ">
-              <div style="position:absolute;left:0;top:0;bottom:0;width:6px;background:${LILAC};"></div>
+            <div style="width:360px;height:160px;display:flex;align-items:flex-start;justify-content:center;">
+              <div style="
+                width:360px;height:135px;background:#fff;border:1px solid rgba(0,0,0,0.12);
+                border-radius:18px;box-shadow:0 4px 14px rgba(0,0,0,0.08);
+                padding:14px;display:flex;gap:12px;align-items:center;
+                position:relative; overflow:hidden;
+              ">
+                <div style="position:absolute;left:0;top:0;bottom:0;width:7px;background:${LILAC};opacity:0.95;"></div>
 
-              <div style="margin-left:6px;display:flex;gap:12px;align-items:center;min-width:0;">
-                ${img}
-                <div style="display:flex;flex-direction:column;gap:6px;min-width:0;">
-                  <div style="font-weight:900;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:210px;">
-                    ${person.name}
+                <div style="margin-left:6px;">${img}</div>
+
+                <div style="display:flex;flex-direction:column;gap:8px;min-width:0;flex:1;">
+
+                  <div style="
+                    font-weight:950;font-size:18px;line-height:1.15;color:#111827;
+                    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+                  ">
+                    ${p.name}
                   </div>
-                  <div style="font-size:12px;font-weight:800;color:#111827;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:210px;">
-                    ${person.team || ""}
+
+                  <div style="
+                    font-size:14px;font-weight:800;color:#111827;
+                    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+                  ">
+                    ${p.team}
                   </div>
-                  <div style="font-size:12px;font-weight:700;color:#374151;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:210px;">
-                    ${person.location || ""}
+
+                  <div style="
+                    font-size:13px;font-weight:800;color:#374151;
+                    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+                  ">
+                    ${p.location}
                   </div>
-                  <div style="font-size:11px;font-weight:700;color:#6B7280;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:210px;">
-                    ${person.email || ""}
+
+                  <div style="
+                    font-size:12px;font-weight:800;color:#6B7280;
+                    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+                  ">
+                    ${p.email}
                   </div>
+
                 </div>
               </div>
             </div>
@@ -380,34 +475,66 @@ export default function ClientPage() {
         })
         .render();
 
-      chartObjRef.current = chart;
+      // POD click: toggle open/close WHOLE subtree at once
+      // (engineering -> deep + everyone under deep opens automatically)
+      chart.onNodeClick((d: any) => {
+        const data: NodeData = d?.data;
+        if (!data?.isPod) return;
 
-      // Pod view’de ilk açılışta pod’lar kapalı kalsın ama root görünür olsun
-      if (viewMode === "pod" && (chart as any).collapseAll) {
-        (chart as any).collapseAll();
-        (chart as any).setExpanded?.(rootId, true);
-        (chart as any).render?.();
-        (chart as any).fit?.();
-      }
+        // Build adjacency from current activeNodes
+        const byParent = new Map<string, string[]>();
+        for (const n of activeNodes) {
+          if (!n.parentId) continue;
+          byParent.set(n.parentId, [...(byParent.get(n.parentId) || []), n.id]);
+        }
+
+        const collectDescendants = (startId: string) => {
+          const out: string[] = [];
+          const stack = [startId];
+          while (stack.length) {
+            const cur = stack.pop()!;
+            const kids = byParent.get(cur) || [];
+            for (const k of kids) {
+              out.push(k);
+              stack.push(k);
+            }
+          }
+          return out;
+        };
+
+        const descendants = collectDescendants(data.id);
+
+        // toggle state
+        const nextExpanded = !data._expanded;
+
+        // apply expanded state to pod node + all descendants
+        const applyExpanded = (id: string, expanded: boolean) => {
+          if (typeof (chart as any).setExpanded === "function") {
+            (chart as any).setExpanded(id, expanded);
+          } else {
+            // fallback: mutate data
+            const node = activeNodes.find((x) => x.id === id);
+            if (node) node._expanded = expanded;
+          }
+        };
+
+        applyExpanded(data.id, nextExpanded);
+        for (const id of descendants) applyExpanded(id, nextExpanded);
+
+        chart.render();
+      });
+
+      chartObjRef.current = chart;
     })();
 
     return () => {
       cancelled = true;
     };
-  }, [podNodes, viewMode, idsByPod, rootId]);
-
-  function onLocalFileCheck(headers: string[]) {
-    const missing = requiredColsMissing(headers);
-    if (missing.length) {
-      setError(`Missing required columns: ${missing.join(", ")}`);
-      return false;
-    }
-    return true;
-  }
+  }, [activeNodes, layout, hierarchyRootId]);
 
   return (
     <div style={{ padding: 20, fontFamily: "system-ui, -apple-system, Segoe UI, Roboto" }}>
-      <h1 style={{ fontSize: 26, fontWeight: 800, margin: "0 0 16px 0" }}>
+      <h1 style={{ fontSize: 26, fontWeight: 900, margin: "0 0 12px 0" }}>
         Aspora Organisational Chart
       </h1>
 
@@ -423,50 +550,37 @@ export default function ClientPage() {
                 setError("Please upload a .csv file.");
                 return;
               }
-
-              // hızlı header doğrulama
-              const text = await file.text();
-              Papa.parse<RawRow>(text, {
-                header: true,
-                preview: 1,
-                complete: (res) => {
-                  const headers = (res.meta.fields || []) as string[];
-                  if (!onLocalFileCheck(headers)) return;
-                  uploadCsvToServer(file);
-                },
-                error: (err: unknown) => setError(err instanceof Error ? err.message : String(err)),
-              });
+              await uploadCsvToServer(file);
             }}
           />
         )}
 
-        <button
-          onClick={() => setViewMode("hierarchy")}
-          style={{
-            padding: "8px 12px",
-            borderRadius: 10,
-            border: viewMode === "hierarchy" ? "2px solid #6D28D9" : "1px solid rgba(0,0,0,0.12)",
-            background: viewMode === "hierarchy" ? "#F5F3FF" : "white",
-            fontWeight: 800,
-          }}
-        >
-          Hierarchy View
-        </button>
-
-        <button
-          onClick={() => setViewMode("pod")}
-          style={{
-            padding: "8px 12px",
-            borderRadius: 10,
-            border: viewMode === "pod" ? "2px solid #6D28D9" : "1px solid rgba(0,0,0,0.12)",
-            background: viewMode === "pod" ? "#F5F3FF" : "white",
-            fontWeight: 800,
-          }}
-        >
-          Pod View
-        </button>
-
-        <div style={{ width: 12 }} />
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <button
+            onClick={() => setLayout("hierarchy")}
+            style={{
+              padding: "8px 12px",
+              borderRadius: 12,
+              border: "1px solid rgba(0,0,0,0.12)",
+              background: layout === "hierarchy" ? LILAC_BG : "#fff",
+              fontWeight: 900,
+            }}
+          >
+            Hierarchy
+          </button>
+          <button
+            onClick={() => setLayout("pod")}
+            style={{
+              padding: "8px 12px",
+              borderRadius: 12,
+              border: "1px solid rgba(0,0,0,0.12)",
+              background: layout === "pod" ? LILAC_BG : "#fff",
+              fontWeight: 900,
+            }}
+          >
+            Pod view
+          </button>
+        </div>
 
         <button onClick={() => chartObjRef.current?.fit()} style={{ padding: "8px 12px" }}>
           Fit
@@ -480,7 +594,7 @@ export default function ClientPage() {
       </div>
 
       {error ? (
-        <div style={{ color: "#b00020", fontWeight: 700, marginBottom: 12 }}>{error}</div>
+        <div style={{ color: "#b00020", fontWeight: 800, marginBottom: 12 }}>{error}</div>
       ) : null}
 
       <div
@@ -496,7 +610,7 @@ export default function ClientPage() {
         <div ref={chartRef} />
       </div>
 
-      <div style={{ marginTop: 10, opacity: 0.7, fontSize: 12 }}>
+      <div style={{ marginTop: 10, opacity: 0.75, fontSize: 12 }}>
         CSV headers expected: Name, Work Email, Manager Email, Team, Location, Photo URL (optional: Pod)
       </div>
     </div>
