@@ -279,7 +279,10 @@ export default function ClientPage() {
         .container(chartRef.current)
         .data(podNodes)
         .nodeWidth(() => (viewMode === "pod" ? 340 : 320))
-        .nodeHeight(() => (viewMode === "pod" ? 90 : 120))
+        .nodeHeight((d: any) => {
+          if (viewMode === "pod" && d?.data?.isPod) return 90;
+          return 120; // person node her zaman 120 kalsın, buton çakışmasın
+        })
         .childrenMargin(() => 50)
         .compactMarginBetween(() => 35)
         .compactMarginPair(() => 80)
@@ -318,6 +321,9 @@ export default function ClientPage() {
 
           // POD NODE (no "x people" text)
           if ((p as any).isPod) {
+            const podName = (p as PodNode).name;
+            const total = (idsByPod.get(podName) || []).length;
+
             return `
               <div style="
                 width:340px;height:90px;background:${LILAC_BG};
@@ -327,12 +333,23 @@ export default function ClientPage() {
                 position:relative; overflow:hidden;
               ">
                 <div style="position:absolute;left:0;top:0;bottom:0;width:6px;background:${LILAC};"></div>
-                <div style="
-                  font-weight:900;font-size:18px;color:#111827;
-                  padding:0 16px; text-align:center;
-                  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:320px;
-                ">
-                  ${(p as PodNode).name}
+
+                <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;padding:0 16px;max-width:320px;">
+                  <div style="
+                    font-weight:900;font-size:18px;color:#111827;
+                    text-align:center;
+                    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;width:100%;
+                  ">
+                    ${(p as PodNode).name}
+                  </div>
+
+                  <div style="
+                    font-size:12px;font-weight:800;color:#6B7280;
+                    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;width:100%;
+                    text-align:center;
+                  ">
+                    ${total} people
+                  </div>
                 </div>
               </div>
             `;
