@@ -5,16 +5,26 @@ import Papa from "papaparse";
 
 type RawRow = Record<string, string>;
 
-type Person = {
+type PersonNode = {
   id: string;
   parentId: string | null;
+  isPod?: false;
   name: string;
   email: string;
   team: string;
   location: string;
   photoUrl: string;
-  pod: string;
+  pod: string; // "" olabilir
 };
+
+type PodNode = {
+  id: string; // "pod:Engineering"
+  parentId: string; // root id
+  isPod: true;
+  name: string; // Pod adı
+};
+
+type ChartNode = PersonNode | PodNode;
 
 function normalizeEmail(v: string) {
   return (v || "").trim().toLowerCase();
@@ -27,52 +37,41 @@ function ensureHttps(url: string) {
   return `https://${u}`;
 }
 
-/**
- * CSV header esneklikleri:
- * - Name / Full Name
- * - Work Email / Email
- * - Manager Email / Manager Work Email
- * - Team / Department
- * - Location / Country
- * - Photo URL / Photo
- * - Pod / POD
- */
+// CSV header alias (senin dosyada bazen değişiyor)
 function pick(row: RawRow, keys: string[]) {
   for (const k of keys) {
     const v = row[k];
-    if (v !== undefined && v !== null && String(v).trim() !== "") return String(v);
+    if (v !== undefined) return v;
   }
   return "";
 }
 
-function avatarFallback(name: string) {
-  return `https://ui-avatars.com/api/?background=eee&color=555&name=${encodeURIComponent(
-    name || "User"
-  )}`;
+function requiredColsMissing(headers: string[]) {
+  // Pod opsiyonel
+  const required = ["Name", "Work Email", "Manager Email", "Team", "Location", "Photo URL"];
+  const set = new Set(headers);
+  return required.filter((c) => !set.has(c));
 }
 
-type LayoutMode = "hierarchy" | "pod";
+type ViewMode = "hierarchy" | "pod";
 
-const LILAC = "#6D28D9";
-const LILAC_BG = "#F5F3FF";
-
-export default function Page() {
+export default function ClientPage() {
   const chartRef = useRef<HTMLDivElement | null>(null);
   const chartObjRef = useRef<any>(null);
 
   const [isEdit, setIsEdit] = useState(false);
+  const [viewMode, setViewMode] = useState<ViewMode>("hierarchy");
+
   const [rows, setRows] = useState<RawRow[]>([]);
   const [error, setError] = useState<string>("");
 
-  const [mode, setMode] = useState<LayoutMode>("hierarchy");
-  const [selectedPod, setSelectedPod] = useState<string>(""); // pod view filter
-
+  // edit=1 sadece sende
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     setIsEdit(params.get("edit") === "1");
   }, []);
 
-  // initial load shared CSV
+  // shared CSV load
   useEffect(() => {
     fetch("/api/org")
       .then(async (r) => {
@@ -84,114 +83,191 @@ export default function Page() {
           header: true,
           skipEmptyLines: true,
           complete: (res) => setRows((res.data || []) as RawRow[]),
-          error: (err: unknown) =>
-            setError(err instanceof Error ? err.message : String(err)),
+          error: (err: unknown) => setError(err instanceof Error ? err.message : String(err)),
         });
       })
       .catch(() => {
-        // first run: no CSV uploaded yet
+        // ilk kurulumda normal: csv yoksa sessiz geç
       });
   }, []);
 
-  const people: Person[] = useMemo(() => {
-    const built: Person[] = (rows || [])
+  // people nodes (her zaman temel kaynak)
+  const people: PersonNode[] = useMemo(() => {
+    return rows
+      .filter((r) => Object.keys(r || {}).length > 0)
       .map((r, i) => {
-        const name = pick(r, ["Name", "Full Name"]).trim();
-        const emailRaw = pick(r, ["Work Email", "Email"]).trim();
-        const managerEmailRaw = pick(r, ["Manager Email", "Manager Work Email"]).trim();
+        const name = String(pick(r, ["Name"])).trim();
+        const email = String(pick(r, ["Work Email", "Email", "Work email"])).trim();
+        const managerEmail = String(pick(r, ["Manager Email", "Manager email"])).trim();
 
-        const email = emailRaw;
-        const id = email ? normalizeEmail(email) : `row:${i}:${name.toLowerCase()}`;
+        const team = String(pick(r, ["Team"])).trim();
+        const location = String(pick(r, ["Location", "Country"])).trim();
 
-        const team = pick(r, ["Team", "Department"]).trim();
-        const location = pick(r, ["Location", "Country"]).trim();
-        const pod = pick(r, ["Pod", "POD"]).trim();
+        // Pod OPSİYONEL: sadece Pod kolonundan
+        const pod = String(pick(r, ["Pod"])).trim();
 
-        const photo = ensureHttps(pick(r, ["Photo URL", "Photo"]).trim());
+        const photo = String(pick(r, ["Photo URL", "Photo Url", "Photo"])).trim();
+
+        const id = email ? normalizeEmail(email) : `name:${name.toLowerCase()}:${i}`;
 
         return {
           id,
-          parentId: managerEmailRaw ? normalizeEmail(managerEmailRaw) : null,
+          parentId: normalizeEmail(managerEmail) || null,
+          isPod: false,
           name: name || email || "(no name)",
           email,
           team,
           location,
           pod,
-          photoUrl: photo || avatarFallback(name || email),
+          photoUrl:
+            ensureHttps(photo) ||
+            `https://ui-avatars.com/api/?background=eee&color=555&name=${encodeURIComponent(
+              name || "User"
+            )}`,
         };
-      })
-      .filter((p) => p.name.trim() !== "");
+      });
+  }, [rows]);
 
-    // Fix invalid parentId -> null (root)
-    const ids = new Set(built.map((p) => p.id));
-    return built.map((p) => ({
+  // manager olmayanları root say (dataset dışı manager varsa da root olsun)
+  const normalizedPeople: PersonNode[] = useMemo(() => {
+    const ids = new Set(people.map((p) => p.id));
+    return people.map((p) => ({
       ...p,
       parentId: p.parentId && ids.has(p.parentId) ? p.parentId : null,
     }));
-  }, [rows]);
-
-  // pod list
-  const pods = useMemo(() => {
-    const set = new Set<string>();
-    for (const p of people) {
-      if (p.pod && p.pod.trim()) set.add(p.pod.trim());
-    }
-    return Array.from(set).sort((a, b) => a.localeCompare(b));
   }, [people]);
 
-  /**
-   * Helper: build quick lookups for hierarchy traversal
-   */
-  const hierarchyIndex = useMemo(() => {
-    const children = new Map<string, string[]>();
-    const byId = new Map<string, Person>();
+  // pod -> person id list (pod view expand için)
+  const idsByPod = useMemo(() => {
+    const map = new Map<string, string[]>();
+    for (const p of normalizedPeople) {
+      if (!p.pod) continue;
+      if (!map.has(p.pod)) map.set(p.pod, []);
+      map.get(p.pod)!.push(p.id);
+    }
+    return map;
+  }, [normalizedPeople]);
 
-    for (const p of people) byId.set(p.id, p);
-
-    for (const p of people) {
-      if (!p.parentId) continue;
-      const arr = children.get(p.parentId) || [];
-      arr.push(p.id);
-      children.set(p.parentId, arr);
+  // root belirle (1'den fazla root varsa super-root oluştur)
+  const { rootId, hierarchyNodes } = useMemo(() => {
+    const roots = normalizedPeople.filter((p) => p.parentId === null);
+    if (roots.length <= 1) {
+      return { rootId: roots[0]?.id || null, hierarchyNodes: normalizedPeople as ChartNode[] };
     }
 
-    function getDescendants(startId: string): string[] {
-      const out: string[] = [];
-      const stack = [...(children.get(startId) || [])];
-      while (stack.length) {
-        const id = stack.pop()!;
-        out.push(id);
-        const ch = children.get(id);
-        if (ch?.length) stack.push(...ch);
-      }
-      return out;
-    }
+    const superRootId = "__root__";
+    const superRoot: PersonNode = {
+      id: superRootId,
+      parentId: null,
+      isPod: false,
+      name: "Aspora",
+      email: "",
+      team: "",
+      location: "",
+      pod: "",
+      photoUrl: `https://ui-avatars.com/api/?background=eee&color=555&name=${encodeURIComponent(
+        "Aspora"
+      )}`,
+    };
 
-    return { byId, children, getDescendants };
-  }, [people]);
+    const patched = normalizedPeople.map((p) =>
+      p.parentId === null ? { ...p, parentId: superRootId } : p
+    );
 
-  /**
-   * Pod mode behavior:
-   * - We do NOT insert pod nodes.
-   * - We keep full hierarchy, but we let user choose a pod,
-   *   and we auto-expand everyone in that pod (leaders + their subtrees),
-   *   and visually show Pod as a badge.
-   */
-  const chartData = useMemo(() => {
-    // same data for both modes (keep real hierarchy always)
-    return people.map((p) => ({
-      ...p,
-      // d3-org-chart expects fields named id/parentId
-      // we keep rest in data for nodeContent
+    return { rootId: superRootId, hierarchyNodes: [superRoot, ...patched] as ChartNode[] };
+  }, [normalizedPeople]);
+
+  // POD VIEW node set üretimi
+  const podNodes: ChartNode[] = useMemo(() => {
+    if (viewMode !== "pod") return hierarchyNodes;
+
+    if (!rootId) return hierarchyNodes;
+
+    // pod node’larını üret (pod boşsa üretme!)
+    const pods = Array.from(idsByPod.keys()).sort((a, b) => a.localeCompare(b));
+    const podGroupNodes: PodNode[] = pods.map((pod) => ({
+      id: `pod:${pod}`,
+      parentId: rootId,
+      isPod: true,
+      name: pod,
     }));
-  }, [people]);
 
-  /**
-   * Upload CSV (edit mode)
-   */
+    // hızlı lookup
+    const byId = new Map<string, PersonNode>();
+    for (const n of hierarchyNodes) {
+      if ((n as any).isPod) continue;
+      byId.set((n as PersonNode).id, n as PersonNode);
+    }
+
+    // Pod view parent rule:
+    // - podu olan kişi:
+    //    - manager yoksa -> pod node altına
+    //    - manager farklı pod / yok -> pod node altına
+    //    - manager aynı pod -> manager’a bağlı kalsın
+    // - podu olmayan: normal hiyerarşi kalsın (No Pod yok!)
+    const patchedPeople: PersonNode[] = (hierarchyNodes as PersonNode[])
+      .filter((n) => !(n as any).isPod)
+      .map((p) => {
+        if (!p.pod) return p;
+
+        const mgr = p.parentId ? byId.get(p.parentId) : null;
+        const mgrPod = mgr?.pod || "";
+
+        if (!mgr || mgrPod !== p.pod) {
+          return { ...p, parentId: `pod:${p.pod}` };
+        }
+        return p;
+      });
+
+    return [...podGroupNodes, ...patchedPeople] as ChartNode[];
+  }, [viewMode, hierarchyNodes, idsByPod, rootId]);
+
+  // ✅ FIX #2: Toplam alt kırılım sayısı (descendants) hesapla
+  // - Person node için: altındaki toplam person sayısı (self hariç)
+  // - Pod node için: altındaki toplam person sayısı
+  const subtreeCounts = useMemo(() => {
+    const nodeById = new Map<string, ChartNode>();
+    const childrenByParent = new Map<string, string[]>();
+
+    for (const n of podNodes) {
+      nodeById.set(n.id, n);
+      if (n.parentId) {
+        if (!childrenByParent.has(n.parentId)) childrenByParent.set(n.parentId, []);
+        childrenByParent.get(n.parentId)!.push(n.id);
+      }
+    }
+
+    const memoTotalPeopleInSubtree = new Map<string, number>();
+
+    const dfsTotalPeople = (id: string): number => {
+      if (memoTotalPeopleInSubtree.has(id)) return memoTotalPeopleInSubtree.get(id)!;
+
+      const node = nodeById.get(id);
+      const isPod = !!(node as any)?.isPod;
+
+      // self person ise 1, pod ise 0
+      let total = isPod ? 0 : 1;
+
+      const kids = childrenByParent.get(id) || [];
+      for (const cid of kids) total += dfsTotalPeople(cid);
+
+      memoTotalPeopleInSubtree.set(id, total);
+      return total;
+    };
+
+    const out: Record<string, number> = {};
+    for (const n of podNodes) {
+      const total = dfsTotalPeople(n.id);
+      const isPod = !!(n as any)?.isPod;
+      // person için self hariç descendants; pod için total
+      out[n.id] = isPod ? total : Math.max(0, total - 1);
+    }
+    return out;
+  }, [podNodes]);
+
+  // Upload
   async function uploadCsvToServer(file: File) {
     setError("");
-
     const pw = prompt("Admin password?");
     if (!pw) return;
 
@@ -214,23 +290,21 @@ export default function Page() {
       header: true,
       skipEmptyLines: true,
       complete: (r) => setRows((r.data || []) as RawRow[]),
-      error: (err: unknown) =>
-        setError(err instanceof Error ? err.message : String(err)),
+      error: (err: unknown) => setError(err instanceof Error ? err.message : String(err)),
     });
   }
 
-  /**
-   * Render chart
-   */
+  // Render chart
   useEffect(() => {
     if (!chartRef.current) return;
 
-    if (!chartData.length) {
+    if (!podNodes.length) {
       chartRef.current.innerHTML = "";
       return;
     }
 
     chartRef.current.innerHTML = "";
+
     let cancelled = false;
 
     (async () => {
@@ -239,163 +313,183 @@ export default function Page() {
 
       if (cancelled || !chartRef.current) return;
 
-      const chart = new OrgChart()
+      const LILAC = "#6D28D9";
+      const LILAC_BG = "#F5F3FF";
+
+      const chartAny: any = new OrgChart()
         .container(chartRef.current)
-        .data(chartData)
-        .nodeWidth(() => 360)
-        .nodeHeight(() => 150) // prevent overlap with button
-        .childrenMargin(() => 60)
-        .compactMarginBetween(() => 40)
-        .compactMarginPair(() => 90)
-        // Button number = TOTAL descendants (not just direct children)
-        .buttonContent((d: any) => {
-          // d has .data.id
-          const id = d?.data?.id as string;
-          if (!id) return "";
-          const allDesc = hierarchyIndex.getDescendants(id);
+        .data(podNodes)
+        .nodeWidth(() => (viewMode === "pod" ? 340 : 320))
+        // ✅ FIX #1: nodeHeight büyüt → button içerik üstüne binmesin
+        .nodeHeight(() => (viewMode === "pod" ? 110 : 140))
+        .childrenMargin(() => 50)
+        .compactMarginBetween(() => 35)
+        .compactMarginPair(() => 80)
+        .onNodeClick((d: any) => {
+          const data = d?.data as ChartNode;
 
-          if (mode === "pod" && selectedPod) {
-            // count only descendants within selected pod
-            const inPod = allDesc.filter((x) => hierarchyIndex.byId.get(x)?.pod === selectedPod);
-            return `${inPod.length}`;
+          // Pod node’a tıklayınca: o pod’un altındaki HER ŞEY tek seferde açılsın/kapanılsın
+          if (data?.isPod) {
+            const podName = (data as PodNode).name;
+            const ids = idsByPod.get(podName) || [];
+            const isExpanded = !!d?.data?._expanded;
+
+            const c = chartAny;
+
+            const safeSet = (id: string, val: boolean) => {
+              if (typeof c.setExpanded === "function") c.setExpanded(id, val);
+            };
+
+            // toggle
+            safeSet(data.id, !isExpanded);
+
+            if (!isExpanded) {
+              for (const id of ids) safeSet(id, true);
+            } else {
+              for (const id of ids) safeSet(id, false);
+            }
+
+            if (typeof c.render === "function") c.render();
+            if (typeof c.fit === "function") c.fit();
           }
-
-          return `${allDesc.length}`;
-        })
-        // Fix button overlap a bit (move it down)
-        .nodeUpdate(function (this: any, d: any) {
-          // `this` is node group
-          try {
-            // move the expand button group slightly down
-            // (safe: if selection/class names change, this just no-ops)
-            const g = this.querySelector?.(".node-button-g");
-            if (g) g.setAttribute("transform", "translate(0, 22)");
-          } catch {}
         })
         .nodeContent((d: any) => {
-          const p = d.data as any;
+          const p = d.data as ChartNode;
 
-          const podBadge =
-            p.pod && p.pod.trim()
-              ? `
+          // POD NODE
+          if ((p as any).isPod) {
+            return `
+              <div style="
+                width:340px;height:90px;background:${LILAC_BG};
+                border:1px solid rgba(0,0,0,0.10);
+                border-radius:18px;box-shadow:0 6px 18px rgba(0,0,0,0.06);
+                display:flex;align-items:center;justify-content:center;
+                position:relative; overflow:hidden;
+              ">
+                <div style="position:absolute;left:0;top:0;bottom:0;width:6px;background:${LILAC};"></div>
                 <div style="
-                  position:absolute; right:14px; top:12px;
-                  font-size:12px;font-weight:900;
-                  color:${LILAC}; background:${LILAC_BG};
-                  border:1px solid rgba(109,40,217,0.25);
-                  padding:4px 10px;border-radius:999px;
-                  max-width:160px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+                  font-weight:900;font-size:18px;color:#111827;
+                  padding:0 16px; text-align:center;
+                  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:320px;
                 ">
-                  ${p.pod}
+                  ${(p as PodNode).name}
                 </div>
-              `
-              : "";
+              </div>
+            `;
+          }
 
-          const img = p.photoUrl
-            ? `<img src="${p.photoUrl}" crossorigin="anonymous"
-                 style="width:72px;height:72px;border-radius:18px;object-fit:cover;border:1px solid rgba(0,0,0,0.10)" />`
-            : `<div style="width:72px;height:72px;border-radius:18px;background:rgba(0,0,0,0.06);
-                 display:flex;align-items:center;justify-content:center;font-weight:900;">
-                 ${String(p.name).trim().slice(0, 1).toUpperCase()}
+          const person = p as PersonNode;
+
+          const img = person.photoUrl
+            ? `<img src="${person.photoUrl}" crossorigin="anonymous"
+                 style="width:64px;height:64px;border-radius:16px;object-fit:cover;border:1px solid rgba(0,0,0,0.12)" />`
+            : `<div style="width:64px;height:64px;border-radius:16px;background:rgba(0,0,0,0.06);
+                 display:flex;align-items:center;justify-content:center;font-weight:700;">
+                 ${String(person.name).trim().slice(0, 1).toUpperCase()}
                </div>`;
 
           return `
             <div style="
-              width:360px;height:150px;background:#fff;
-              border:1px solid rgba(0,0,0,0.12);
-              border-radius:22px;
-              box-shadow:0 10px 26px rgba(0,0,0,0.07);
-              padding:14px 14px 14px 14px;
-              display:flex;gap:14px;align-items:center;
-              position:relative;
-              overflow:hidden;
+              width:320px;height:120px;background:#fff;border:1px solid rgba(0,0,0,0.12);
+              border-radius:16px;box-shadow:0 2px 10px rgba(0,0,0,0.06);
+              padding:12px;display:flex;gap:12px;align-items:center;
+              position:relative; overflow:hidden;
             ">
-              <div style="position:absolute;left:0;top:0;bottom:0;width:7px;background:${LILAC};"></div>
-              ${podBadge}
-              ${img}
-              <div style="display:flex;flex-direction:column;gap:8px;min-width:0;flex:1;padding-right:10px;">
-                <div style="
-                  font-weight:950;font-size:22px;line-height:1.1;color:#111827;
-                  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-                ">
-                  ${p.name}
-                </div>
+              <div style="position:absolute;left:0;top:0;bottom:0;width:6px;background:${LILAC};"></div>
 
-                <div style="
-                  font-size:14px;font-weight:900;color:#111827;
-                  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-                ">
-                  ${p.team || ""}
-                </div>
-
-                <div style="
-                  font-size:14px;font-weight:800;color:#374151;
-                  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-                ">
-                  ${p.location || ""}
-                </div>
-
-                <div style="
-                  font-size:14px;font-weight:800;color:#6B7280;
-                  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-                ">
-                  ${p.email || ""}
+              <div style="margin-left:6px;display:flex;gap:12px;align-items:center;min-width:0;">
+                ${img}
+                <div style="display:flex;flex-direction:column;gap:6px;min-width:0;">
+                  <div style="font-weight:900;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:210px;">
+                    ${person.name}
+                  </div>
+                  <div style="font-size:12px;font-weight:800;color:#111827;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:210px;">
+                    ${person.team || ""}
+                  </div>
+                  <div style="font-size:12px;font-weight:700;color:#374151;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:210px;">
+                    ${person.location || ""}
+                  </div>
+                  <div style="font-size:11px;font-weight:700;color:#6B7280;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:210px;">
+                    ${person.email || ""}
+                  </div>
                 </div>
               </div>
             </div>
           `;
-        })
-        .render();
+        });
 
-      chartObjRef.current = chart;
+      // ✅ FIX #2: button üzerindeki sayı = subtreeCounts (toplam descendants)
+      if (typeof chartAny.buttonContent === "function") {
+        chartAny.buttonContent((d: any) => {
+          const data = d?.data || d;
+          const id = data?.id as string;
+          const count = subtreeCounts[id] ?? 0;
 
-      // POD MODE: auto-expand everyone in selected pod
-      if (mode === "pod" && selectedPod) {
-        try {
-          // Expand all nodes that are in selected pod AND their ancestors (to make reachable)
-          const inPodIds = people.filter((p) => p.pod === selectedPod).map((p) => p.id);
-          const toExpand = new Set<string>();
+          // caret: expanded / collapsed
+          const expanded = !!(data?._expanded ?? d?._expanded);
+          const caret = expanded ? "▴" : "▾";
 
-          // Expand all ancestors of in-pod nodes
-          for (const id of inPodIds) {
-            let cur = hierarchyIndex.byId.get(id);
-            while (cur?.parentId) {
-              toExpand.add(cur.parentId);
-              cur = hierarchyIndex.byId.get(cur.parentId);
-            }
-          }
+          // küçük pill: "▾ 39" gibi
+          return `
+            <div style="
+              display:inline-flex;align-items:center;gap:6px;
+              padding:4px 10px;border-radius:999px;
+              border:1px solid rgba(0,0,0,0.18);
+              background:#fff;
+              font-weight:900;font-size:12px;color:#111827;
+              box-shadow:0 2px 8px rgba(0,0,0,0.10);
+              line-height:1;
+              transform: translateY(10px);
+            ">
+              <span style="font-size:12px">${caret}</span>
+              <span>${count}</span>
+            </div>
+          `;
+        });
+      }
 
-          // Expand the in-pod managers too (so their children open)
-          for (const id of inPodIds) toExpand.add(id);
+      chartAny.render();
 
-          // best-effort API (depends on d3-org-chart version)
-          if (typeof chart.setExpanded === "function") {
-            for (const id of toExpand) chart.setExpanded(id, true);
-            chart.render();
-          } else if (typeof chart.expand === "function") {
-            for (const id of toExpand) chart.expand(id);
-          } else {
-            // fallback
-            chart.expandAll?.();
-          }
-        } catch {
-          // ignore
-        }
+      chartObjRef.current = chartAny;
+
+      // Pod view’de ilk açılışta pod’lar kapalı kalsın ama root görünür olsun
+      if (viewMode === "pod" && chartAny.collapseAll) {
+        chartAny.collapseAll();
+        chartAny.setExpanded?.(rootId, true);
+        chartAny.render?.();
+        chartAny.fit?.();
       }
     })();
 
     return () => {
       cancelled = true;
     };
-  }, [chartData, mode, selectedPod, hierarchyIndex, people]);
+  }, [podNodes, viewMode, idsByPod, rootId, subtreeCounts]);
+
+  function onLocalFileCheck(headers: string[]) {
+    const missing = requiredColsMissing(headers);
+    if (missing.length) {
+      setError(`Missing required columns: ${missing.join(", ")}`);
+      return false;
+    }
+    return true;
+  }
 
   return (
     <div style={{ padding: 20, fontFamily: "system-ui, -apple-system, Segoe UI, Roboto" }}>
-      <h1 style={{ fontSize: 26, fontWeight: 900, margin: "0 0 14px 0" }}>
+      <h1 style={{ fontSize: 26, fontWeight: 800, margin: "0 0 16px 0" }}>
         Aspora Organisational Chart
       </h1>
 
-      <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 12, flexWrap: "wrap" }}>
+      <div
+        style={{
+          display: "flex",
+          gap: 12,
+          alignItems: "center",
+          marginBottom: 12,
+          flexWrap: "wrap",
+        }}
+      >
         {isEdit && (
           <input
             type="file"
@@ -407,56 +501,50 @@ export default function Page() {
                 setError("Please upload a .csv file.");
                 return;
               }
-              await uploadCsvToServer(file);
+
+              // hızlı header doğrulama
+              const text = await file.text();
+              Papa.parse<RawRow>(text, {
+                header: true,
+                preview: 1,
+                complete: (res) => {
+                  const headers = (res.meta.fields || []) as string[];
+                  if (!onLocalFileCheck(headers)) return;
+                  uploadCsvToServer(file);
+                },
+                error: (err: unknown) => setError(err instanceof Error ? err.message : String(err)),
+              });
             }}
           />
         )}
 
         <button
-          onClick={() => setMode("hierarchy")}
+          onClick={() => setViewMode("hierarchy")}
           style={{
             padding: "8px 12px",
             borderRadius: 10,
-            border: "1px solid rgba(0,0,0,0.12)",
-            background: mode === "hierarchy" ? LILAC_BG : "white",
-            fontWeight: 900,
+            border: viewMode === "hierarchy" ? "2px solid #6D28D9" : "1px solid rgba(0,0,0,0.12)",
+            background: viewMode === "hierarchy" ? "#F5F3FF" : "white",
+            fontWeight: 800,
           }}
         >
-          Hierarchy
+          Hierarchy View
         </button>
 
         <button
-          onClick={() => setMode("pod")}
+          onClick={() => setViewMode("pod")}
           style={{
             padding: "8px 12px",
             borderRadius: 10,
-            border: "1px solid rgba(0,0,0,0.12)",
-            background: mode === "pod" ? LILAC_BG : "white",
-            fontWeight: 900,
+            border: viewMode === "pod" ? "2px solid #6D28D9" : "1px solid rgba(0,0,0,0.12)",
+            background: viewMode === "pod" ? "#F5F3FF" : "white",
+            fontWeight: 800,
           }}
         >
-          Pod
+          Pod View
         </button>
 
-        {mode === "pod" && (
-          <select
-            value={selectedPod}
-            onChange={(e) => setSelectedPod(e.target.value)}
-            style={{
-              padding: "8px 12px",
-              borderRadius: 10,
-              border: "1px solid rgba(0,0,0,0.12)",
-              fontWeight: 800,
-            }}
-          >
-            <option value="">Select pod…</option>
-            {pods.map((p) => (
-              <option key={p} value={p}>
-                {p}
-              </option>
-            ))}
-          </select>
-        )}
+        <div style={{ width: 12 }} />
 
         <button onClick={() => chartObjRef.current?.fit()} style={{ padding: "8px 12px" }}>
           Fit
@@ -470,7 +558,7 @@ export default function Page() {
       </div>
 
       {error ? (
-        <div style={{ color: "#b00020", fontWeight: 800, marginBottom: 12 }}>{error}</div>
+        <div style={{ color: "#b00020", fontWeight: 700, marginBottom: 12 }}>{error}</div>
       ) : null}
 
       <div
@@ -487,8 +575,7 @@ export default function Page() {
       </div>
 
       <div style={{ marginTop: 10, opacity: 0.7, fontSize: 12 }}>
-        CSV headers accepted: Name/Full Name, Work Email/Email, Manager Email/Manager Work Email, Team/Department,
-        Location/Country, Photo URL/Photo, Pod/POD.
+        CSV headers expected: Name, Work Email, Manager Email, Team, Location, Photo URL (optional: Pod)
       </div>
     </div>
   );
