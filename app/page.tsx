@@ -165,9 +165,7 @@ export default function ClientPage() {
       team: "",
       location: "",
       pod: "",
-      photoUrl: `https://ui-avatars.com/api/?background=eee&color=555&name=${encodeURIComponent(
-        "Aspora"
-      )}`,
+      photoUrl: `https://ui-avatars.com/api/?background=eee&color=555&name=${encodeURIComponent("Aspora")}`,
     };
 
     const patched = normalizedPeople.map((p) =>
@@ -205,65 +203,26 @@ export default function ClientPage() {
     //    - manager farklı pod / yok -> pod node altına
     //    - manager aynı pod -> manager’a bağlı kalsın
     // - podu olmayan: normal hiyerarşi kalsın (No Pod yok!)
-    const patchedPeople: PersonNode[] = (hierarchyNodes as PersonNode[])
-      .filter((n) => !(n as any).isPod)
-      .map((p) => {
-        if (!p.pod) return p;
+    const patchedPeople: PersonNode[] = (hierarchyNodes as PersonNode[]).filter(
+      (n) => !(n as any).isPod
+    ).map((p) => {
+      if (!p.pod) return p;
 
-        const mgr = p.parentId ? byId.get(p.parentId) : null;
-        const mgrPod = mgr?.pod || "";
+      const mgr = p.parentId ? byId.get(p.parentId) : null;
+      const mgrPod = mgr?.pod || "";
 
-        if (!mgr || mgrPod !== p.pod) {
-          return { ...p, parentId: `pod:${p.pod}` };
-        }
-        return p;
-      });
+      if (!mgr || mgrPod !== p.pod) {
+        return { ...p, parentId: `pod:${p.pod}` };
+      }
+      return p;
+    });
+
+    // root kişinin kendi pod’u varsa bile root’u bozma:
+    // (root CEO, pod node'lar zaten root altında)
+    // root kişi patchedPeople içinde kalıyor.
 
     return [...podGroupNodes, ...patchedPeople] as ChartNode[];
   }, [viewMode, hierarchyNodes, idsByPod, rootId]);
-
-  // ✅ FIX #2: Toplam alt kırılım sayısı (descendants) hesapla
-  // - Person node için: altındaki toplam person sayısı (self hariç)
-  // - Pod node için: altındaki toplam person sayısı
-  const subtreeCounts = useMemo(() => {
-    const nodeById = new Map<string, ChartNode>();
-    const childrenByParent = new Map<string, string[]>();
-
-    for (const n of podNodes) {
-      nodeById.set(n.id, n);
-      if (n.parentId) {
-        if (!childrenByParent.has(n.parentId)) childrenByParent.set(n.parentId, []);
-        childrenByParent.get(n.parentId)!.push(n.id);
-      }
-    }
-
-    const memoTotalPeopleInSubtree = new Map<string, number>();
-
-    const dfsTotalPeople = (id: string): number => {
-      if (memoTotalPeopleInSubtree.has(id)) return memoTotalPeopleInSubtree.get(id)!;
-
-      const node = nodeById.get(id);
-      const isPod = !!(node as any)?.isPod;
-
-      // self person ise 1, pod ise 0
-      let total = isPod ? 0 : 1;
-
-      const kids = childrenByParent.get(id) || [];
-      for (const cid of kids) total += dfsTotalPeople(cid);
-
-      memoTotalPeopleInSubtree.set(id, total);
-      return total;
-    };
-
-    const out: Record<string, number> = {};
-    for (const n of podNodes) {
-      const total = dfsTotalPeople(n.id);
-      const isPod = !!(n as any)?.isPod;
-      // person için self hariç descendants; pod için total
-      out[n.id] = isPod ? total : Math.max(0, total - 1);
-    }
-    return out;
-  }, [podNodes]);
 
   // Upload
   async function uploadCsvToServer(file: File) {
@@ -316,106 +275,52 @@ export default function ClientPage() {
       const LILAC = "#6D28D9";
       const LILAC_BG = "#F5F3FF";
 
-      // Node ölçüleri (nodeContent içindeki width/height ile uyumlu)
-      const PERSON_W = 320;
-      const PERSON_H = 120;
-      const POD_W = 340;
-      const POD_H = 90;
-
-      const BUTTON_W = 34;
-      const BUTTON_H = 34;
-      const BUTTON_GAP = 10;
-
-      const dims = (d: any) =>
-        d?.data?.isPod ? { w: POD_W, h: POD_H } : { w: PERSON_W, h: PERSON_H };
-
-      const chartAny: any = new OrgChart()
+      const chart = new OrgChart()
         .container(chartRef.current)
         .data(podNodes)
-        .nodeWidth((d: any) => (d?.data?.isPod ? POD_W : PERSON_W))
-        // Buton + boşluk için ekstra yükseklik ekle (button içerik üstüne binmesin)
-        .nodeHeight((d: any) => dims(d).h + BUTTON_H + BUTTON_GAP + 10)
+        .nodeWidth(() => (viewMode === "pod" ? 340 : 320))
+        .nodeHeight(() => (viewMode === "pod" ? 90 : 120))
         .childrenMargin(() => 50)
         .compactMarginBetween(() => 35)
-        .compactMarginPair(() => 80);
-
-      // --- Button (count + position) ---
-      if (typeof chartAny.buttonContent === "function") {
-        chartAny.buttonContent((d: any) => {
-          const data = d?.data || d;
-          const id = data?.id as string;
-          const count = subtreeCounts[id] ?? 0;
-
-          // leaf node: hiç buton gösterme
-          if (!count) return "";
-
-          const expanded = !!(data?._expanded ?? d?._expanded);
-          const caret = expanded ? "▴" : "▾";
-
-          return `
-            <div style="
-              display:inline-flex;align-items:center;gap:6px;
-              padding:4px 10px;border-radius:999px;
-              border:1px solid rgba(0,0,0,0.18);
-              background:#fff;
-              font-weight:900;font-size:12px;color:#111827;
-              box-shadow:0 2px 8px rgba(0,0,0,0.10);
-              line-height:1;
-            ">
-              <span style="font-size:12px">${caret}</span>
-              <span>${count}</span>
-            </div>
-          `;
-        });
-      }
-
-      if (typeof chartAny.buttonWidth === "function") chartAny.buttonWidth(() => BUTTON_W);
-      if (typeof chartAny.buttonHeight === "function") chartAny.buttonHeight(() => BUTTON_H);
-
-      // Ortala + node altına koy
-      if (typeof chartAny.buttonX === "function")
-        chartAny.buttonX((d: any) => dims(d).w / 2);
-      if (typeof chartAny.buttonY === "function")
-        chartAny.buttonY((d: any) => dims(d).h + BUTTON_GAP);
-      // --- END Button ---
-
-      chartAny
+        .compactMarginPair(() => 80)
         .onNodeClick((d: any) => {
           const data = d?.data as ChartNode;
 
           // Pod node’a tıklayınca: o pod’un altındaki HER ŞEY tek seferde açılsın/kapanılsın
           if (data?.isPod) {
-            const podName = (data as PodNode).name;
+            const podName = data.name;
             const ids = idsByPod.get(podName) || [];
             const isExpanded = !!d?.data?._expanded;
 
-            const c = chartAny;
+            const c = chart as any;
 
             const safeSet = (id: string, val: boolean) => {
               if (typeof c.setExpanded === "function") c.setExpanded(id, val);
             };
 
-            // toggle pod
+            // toggle
             safeSet(data.id, !isExpanded);
 
+            // pod açılıyorsa: pod içindeki herkes expand olsun
             if (!isExpanded) {
               for (const id of ids) safeSet(id, true);
             } else {
+              // pod kapanıyorsa: pod içindeki herkes collapse olsun
               for (const id of ids) safeSet(id, false);
             }
 
-            c.render?.();
-            c.fit?.();
+            if (typeof c.render === "function") c.render();
+            if (typeof c.fit === "function") c.fit();
           }
         })
         .nodeContent((d: any) => {
           const p = d.data as ChartNode;
 
-          // POD NODE
+          // POD NODE (no "x people" text)
           if ((p as any).isPod) {
             return `
               <div style="
-                width:${POD_W}px;height:${POD_H}px;background:${LILAC_BG};
+                width:340px;height:90px;background:${LILAC_BG};
                 border:1px solid rgba(0,0,0,0.10);
                 border-radius:18px;box-shadow:0 6px 18px rgba(0,0,0,0.06);
                 display:flex;align-items:center;justify-content:center;
@@ -425,7 +330,7 @@ export default function ClientPage() {
                 <div style="
                   font-weight:900;font-size:18px;color:#111827;
                   padding:0 16px; text-align:center;
-                  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:${POD_W - 20}px;
+                  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:320px;
                 ">
                   ${(p as PodNode).name}
                 </div>
@@ -437,15 +342,16 @@ export default function ClientPage() {
 
           const img = person.photoUrl
             ? `<img src="${person.photoUrl}" crossorigin="anonymous"
-                style="width:64px;height:64px;border-radius:16px;object-fit:cover;border:1px solid rgba(0,0,0,0.12)" />`
+                 style="width:64px;height:64px;border-radius:16px;object-fit:cover;border:1px solid rgba(0,0,0,0.12)" />`
             : `<div style="width:64px;height:64px;border-radius:16px;background:rgba(0,0,0,0.06);
-                display:flex;align-items:center;justify-content:center;font-weight:700;">
-                ${String(person.name).trim().slice(0, 1).toUpperCase()}
-              </div>`;
+                 display:flex;align-items:center;justify-content:center;font-weight:700;">
+                 ${String(person.name).trim().slice(0, 1).toUpperCase()}
+               </div>`;
 
+          // Sadece: Name / Team / Location / Email
           return `
             <div style="
-              width:${PERSON_W}px;height:${PERSON_H}px;background:#fff;border:1px solid rgba(0,0,0,0.12);
+              width:320px;height:120px;background:#fff;border:1px solid rgba(0,0,0,0.12);
               border-radius:16px;box-shadow:0 2px 10px rgba(0,0,0,0.06);
               padding:12px;display:flex;gap:12px;align-items:center;
               position:relative; overflow:hidden;
@@ -471,24 +377,24 @@ export default function ClientPage() {
               </div>
             </div>
           `;
-        });
+        })
+        .render();
 
-      chartAny.render();
-      chartObjRef.current = chartAny;
+      chartObjRef.current = chart;
 
       // Pod view’de ilk açılışta pod’lar kapalı kalsın ama root görünür olsun
-      if (viewMode === "pod" && chartAny.collapseAll) {
-        chartAny.collapseAll();
-        chartAny.setExpanded?.(rootId, true);
-        chartAny.render?.();
-        chartAny.fit?.();
+      if (viewMode === "pod" && (chart as any).collapseAll) {
+        (chart as any).collapseAll();
+        (chart as any).setExpanded?.(rootId, true);
+        (chart as any).render?.();
+        (chart as any).fit?.();
       }
     })();
 
     return () => {
       cancelled = true;
     };
-  }, [podNodes, viewMode, idsByPod, rootId, subtreeCounts]);
+  }, [podNodes, viewMode, idsByPod, rootId]);
 
   function onLocalFileCheck(headers: string[]) {
     const missing = requiredColsMissing(headers);
@@ -505,15 +411,7 @@ export default function ClientPage() {
         Aspora Organisational Chart
       </h1>
 
-      <div
-        style={{
-          display: "flex",
-          gap: 12,
-          alignItems: "center",
-          marginBottom: 12,
-          flexWrap: "wrap",
-        }}
-      >
+      <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 12, flexWrap: "wrap" }}>
         {isEdit && (
           <input
             type="file"
