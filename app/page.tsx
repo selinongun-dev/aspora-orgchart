@@ -193,7 +193,8 @@ export default function ClientPage() {
             setError("");
             setRows((res.data || []) as RawRow[]);
           },
-          error: (err) => setError(err instanceof Error ? err.message : String(err)),
+          error: (err: unknown) =>
+            setError(err instanceof Error ? err.message : String(err)),
         });
       })
       .catch(() => {
