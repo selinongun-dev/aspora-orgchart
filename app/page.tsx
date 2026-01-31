@@ -3,19 +3,9 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import Papa from "papaparse";
 
-type RawRow = Record<string, any>;
+type RawRow = Record<string, string>;
 
-type Row = {
-  Name: string;
-  "Work Email": string;
-  "Manager Email": string;
-  Team: string;
-  Location: string;
-  "Photo URL": string;
-  Pod?: string;
-};
-
-type NodeData = {
+type Person = {
   id: string;
   parentId: string | null;
   name: string;
@@ -23,26 +13,11 @@ type NodeData = {
   team: string;
   location: string;
   photoUrl: string;
-  pod?: string;
-
-  // flags
-  isPod?: boolean;
-  podKey?: string;
-
-  // expansion
-  _expanded?: boolean;
+  pod: string;
 };
-
-const LILAC = "#6D28D9";
-const LILAC_BG = "#F5F3FF";
-const BORDER = "rgba(17,24,39,0.14)"; // slate-ish
 
 function normalizeEmail(v: string) {
   return (v || "").trim().toLowerCase();
-}
-
-function normalizeText(v: string) {
-  return String(v ?? "").trim();
 }
 
 function ensureHttps(url: string) {
@@ -53,59 +28,51 @@ function ensureHttps(url: string) {
 }
 
 /**
- * Header aliases:
- * Your CSV now can contain e.g. Job Title / Manager Name etc.
- * We only map what we need, with flexible column names.
+ * CSV header esneklikleri:
+ * - Name / Full Name
+ * - Work Email / Email
+ * - Manager Email / Manager Work Email
+ * - Team / Department
+ * - Location / Country
+ * - Photo URL / Photo
+ * - Pod / POD
  */
-function toRow(r: RawRow): Row {
-  const get = (...keys: string[]) => {
-    for (const k of keys) {
-      if (r[k] !== undefined && r[k] !== null && String(r[k]).trim() !== "") return r[k];
-    }
-    return "";
-  };
-
-  return {
-    Name: normalizeText(get("Name", "Full Name")),
-    "Work Email": normalizeText(get("Work Email", "Email", "Work email", "WorkEmail")),
-    "Manager Email": normalizeText(get("Manager Email", "ManagerEmail", "Manager E-mail")),
-    Team: normalizeText(get("Team", "Department", "Function")),
-    Location: normalizeText(get("Location", "Country", "Office", "Region")),
-    "Photo URL": normalizeText(get("Photo URL", "Photo", "PhotoURL", "Photo Url")),
-    Pod: normalizeText(get("Pod", "POD", "Squad", "Tribe")),
-  };
+function pick(row: RawRow, keys: string[]) {
+  for (const k of keys) {
+    const v = row[k];
+    if (v !== undefined && v !== null && String(v).trim() !== "") return String(v);
+  }
+  return "";
 }
 
-function requiredColsMissing(headers: string[]) {
-  // We require at least these columns (Pod optional)
-  const required = ["Name", "Work Email", "Manager Email", "Team", "Location", "Photo URL"];
-  const set = new Set(headers);
-  // allow aliases by accepting any header set that includes at least one of the key variants:
-  // We'll enforce after parsing by checking Row fields too.
-  return required.filter((c) => !set.has(c));
+function avatarFallback(name: string) {
+  return `https://ui-avatars.com/api/?background=eee&color=555&name=${encodeURIComponent(
+    name || "User"
+  )}`;
 }
 
-type LayoutMode = "hierarchy" | "pods";
+type LayoutMode = "hierarchy" | "pod";
 
-export default function ClientPage() {
+const LILAC = "#6D28D9";
+const LILAC_BG = "#F5F3FF";
+
+export default function Page() {
   const chartRef = useRef<HTMLDivElement | null>(null);
   const chartObjRef = useRef<any>(null);
 
   const [isEdit, setIsEdit] = useState(false);
-  const [layout, setLayout] = useState<LayoutMode>("hierarchy");
-
-  const [rows, setRows] = useState<Row[]>([]);
+  const [rows, setRows] = useState<RawRow[]>([]);
   const [error, setError] = useState<string>("");
 
-  // which pods are expanded in pod mode
-  const [expandedPods, setExpandedPods] = useState<Record<string, boolean>>({});
+  const [mode, setMode] = useState<LayoutMode>("hierarchy");
+  const [selectedPod, setSelectedPod] = useState<string>(""); // pod view filter
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     setIsEdit(params.get("edit") === "1");
   }, []);
 
-  // Load shared CSV
+  // initial load shared CSV
   useEffect(() => {
     fetch("/api/org")
       .then(async (r) => {
@@ -116,339 +83,112 @@ export default function ClientPage() {
         Papa.parse<RawRow>(text, {
           header: true,
           skipEmptyLines: true,
-          complete: (res) => {
-            const raw = (res.data || []) as RawRow[];
-            const mapped = raw.map(toRow);
-
-            // basic sanity: Name required
-            const cleaned = mapped.filter((x) => x.Name.trim() !== "");
-            setRows(cleaned);
-          },
-          error: (err: unknown) => setError(err instanceof Error ? err.message : String(err)),
+          complete: (res) => setRows((res.data || []) as RawRow[]),
+          error: (err: unknown) =>
+            setError(err instanceof Error ? err.message : String(err)),
         });
       })
       .catch(() => {
-        // first run normal
+        // first run: no CSV uploaded yet
       });
   }, []);
 
-  // Build base "people nodes" once
-  const peopleNodes: NodeData[] = useMemo(() => {
-    const built = rows.map((r, i) => {
-      const email = normalizeEmail(r["Work Email"]);
-      const name = normalizeText(r.Name);
+  const people: Person[] = useMemo(() => {
+    const built: Person[] = (rows || [])
+      .map((r, i) => {
+        const name = pick(r, ["Name", "Full Name"]).trim();
+        const emailRaw = pick(r, ["Work Email", "Email"]).trim();
+        const managerEmailRaw = pick(r, ["Manager Email", "Manager Work Email"]).trim();
 
-      const id = email || `name:${name.toLowerCase()}:${i}`;
+        const email = emailRaw;
+        const id = email ? normalizeEmail(email) : `row:${i}:${name.toLowerCase()}`;
 
-      const photo =
-        ensureHttps(r["Photo URL"] || "") ||
-        `https://ui-avatars.com/api/?background=eee&color=555&name=${encodeURIComponent(
-          name || "User"
-        )}`;
+        const team = pick(r, ["Team", "Department"]).trim();
+        const location = pick(r, ["Location", "Country"]).trim();
+        const pod = pick(r, ["Pod", "POD"]).trim();
 
-      return {
-        id,
-        parentId: normalizeEmail(r["Manager Email"]) || null,
-        name: name || email || "(no name)",
-        email: normalizeText(r["Work Email"]),
-        team: normalizeText(r.Team),
-        location: normalizeText(r.Location),
-        photoUrl: photo,
-        pod: normalizeText(r.Pod || "") || undefined,
-      };
-    });
+        const photo = ensureHttps(pick(r, ["Photo URL", "Photo"]).trim());
 
-    // Fix parentId if manager missing from dataset (becomes root)
-    const ids = new Set(built.map((n) => n.id));
-    return built.map((n) => ({
-      ...n,
-      parentId: n.parentId && ids.has(n.parentId) ? n.parentId : null,
+        return {
+          id,
+          parentId: managerEmailRaw ? normalizeEmail(managerEmailRaw) : null,
+          name: name || email || "(no name)",
+          email,
+          team,
+          location,
+          pod,
+          photoUrl: photo || avatarFallback(name || email),
+        };
+      })
+      .filter((p) => p.name.trim() !== "");
+
+    // Fix invalid parentId -> null (root)
+    const ids = new Set(built.map((p) => p.id));
+    return built.map((p) => ({
+      ...p,
+      parentId: p.parentId && ids.has(p.parentId) ? p.parentId : null,
     }));
   }, [rows]);
 
-  // find root (CEO): the first node with parentId null
-  const rootId = useMemo(() => {
-    const r = peopleNodes.find((n) => n.parentId === null);
-    return r?.id || (peopleNodes[0]?.id ?? null);
-  }, [peopleNodes]);
+  // pod list
+  const pods = useMemo(() => {
+    const set = new Set<string>();
+    for (const p of people) {
+      if (p.pod && p.pod.trim()) set.add(p.pod.trim());
+    }
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }, [people]);
 
   /**
-   * POD MODE GRAPH:
-   * - Create virtual nodes: pod:<podKey>
-   * - CEO children become all pods (not "No Pod")
-   * - Inside each pod:
-   *    - keep manager->report relations ONLY if manager is in same pod
-   *    - otherwise attach person to pod node
-   * - Clicking pod should expand all inside that pod (we drive via expandedPods + _expanded flags)
+   * Helper: build quick lookups for hierarchy traversal
    */
-  const nodes: NodeData[] = useMemo(() => {
-    if (!peopleNodes.length) return [];
+  const hierarchyIndex = useMemo(() => {
+    const children = new Map<string, string[]>();
+    const byId = new Map<string, Person>();
 
-    if (layout === "hierarchy") {
-      // plain hierarchy
-      return peopleNodes.map((n) => ({ ...n }));
+    for (const p of people) byId.set(p.id, p);
+
+    for (const p of people) {
+      if (!p.parentId) continue;
+      const arr = children.get(p.parentId) || [];
+      arr.push(p.id);
+      children.set(p.parentId, arr);
     }
 
-    // pods layout
-    const root = rootId;
-    if (!root) return peopleNodes.map((n) => ({ ...n }));
-
-    const byId = new Map<string, NodeData>();
-    for (const n of peopleNodes) byId.set(n.id, n);
-
-    // gather pods (exclude empty)
-    const pods = Array.from(
-      new Set(
-        peopleNodes
-          .map((n) => normalizeText(n.pod || ""))
-          .map((x) => x.trim())
-          .filter((x) => x.length > 0)
-      )
-    ).sort((a, b) => a.localeCompare(b));
-
-    // virtual pod nodes
-    const podNodes: NodeData[] = pods.map((p) => {
-      const key = p; // already a label
-      return {
-        id: `pod:${key.toLowerCase()}`,
-        parentId: root, // all pods under CEO
-        name: key,
-        email: "",
-        team: "",
-        location: "",
-        photoUrl: "",
-        isPod: true,
-        podKey: key,
-        _expanded: !!expandedPods[key],
-      };
-    });
-
-    const podIdByKey = new Map<string, string>();
-    for (const pn of podNodes) podIdByKey.set(pn.podKey!, pn.id);
-
-    // Assign people under pods
-    const peopleInPod: NodeData[] = peopleNodes.map((n) => {
-      const podKey = (n.pod || "").trim();
-      if (!podKey) {
-        // No pod: keep in original hierarchy (CEO etc.)
-        return { ...n };
+    function getDescendants(startId: string): string[] {
+      const out: string[] = [];
+      const stack = [...(children.get(startId) || [])];
+      while (stack.length) {
+        const id = stack.pop()!;
+        out.push(id);
+        const ch = children.get(id);
+        if (ch?.length) stack.push(...ch);
       }
-
-      const managerId = n.parentId;
-      const manager = managerId ? byId.get(managerId) : null;
-      const samePodManager = manager && (manager.pod || "").trim() === podKey;
-
-      // If manager is same pod, keep original parentId
-      // Else attach to pod node
-      const parentId = samePodManager ? managerId : podIdByKey.get(podKey)!;
-
-      // expansion rule: if pod is expanded, expand everything under it
-      const expanded = !!expandedPods[podKey];
-
-      return {
-        ...n,
-        parentId,
-        _expanded: expanded ? true : undefined,
-      };
-    });
-
-    // Important: CEO should remain the root visible node.
-    // If CEO has a Pod in CSV, we still keep CEO as root (not inside pod).
-    // So force root node to have parentId null.
-    const final = [...podNodes, ...peopleInPod].map((n) =>
-      n.id === root ? { ...n, parentId: null } : n
-    );
-
-    return final;
-  }, [peopleNodes, layout, expandedPods, rootId]);
-
-  // Render chart
-  useEffect(() => {
-    if (!chartRef.current) return;
-
-    if (!nodes.length) {
-      chartRef.current.innerHTML = "";
-      return;
+      return out;
     }
 
-    chartRef.current.innerHTML = "";
+    return { byId, children, getDescendants };
+  }, [people]);
 
-    let cancelled = false;
+  /**
+   * Pod mode behavior:
+   * - We do NOT insert pod nodes.
+   * - We keep full hierarchy, but we let user choose a pod,
+   *   and we auto-expand everyone in that pod (leaders + their subtrees),
+   *   and visually show Pod as a badge.
+   */
+  const chartData = useMemo(() => {
+    // same data for both modes (keep real hierarchy always)
+    return people.map((p) => ({
+      ...p,
+      // d3-org-chart expects fields named id/parentId
+      // we keep rest in data for nodeContent
+    }));
+  }, [people]);
 
-    (async () => {
-      const mod = await import("d3-org-chart");
-      const OrgChart = (mod as any).OrgChart;
-
-      if (cancelled || !chartRef.current) return;
-
-      const chart = new OrgChart()
-        .container(chartRef.current)
-        .data(nodes)
-        .nodeWidth((d: any) => (d.data?.isPod ? 360 : 520))
-        // Make node taller so the expand button sits UNDER the card, not on top of text
-        .nodeHeight((d: any) => (d.data?.isPod ? 120 : 190))
-        .childrenMargin(() => 60)
-        .compactMarginBetween(() => 40)
-        .compactMarginPair(() => 90)
-
-        // Show TOTAL descendants count (not just direct children)
-        .buttonContent((d: any) => {
-          const data: NodeData = d.data;
-
-          // total descendants excluding self
-          const totalDesc = (d.descendants?.()?.length ?? 1) - 1;
-
-          // For pod node, show pod total people count (descendants excluding pod node)
-          const label = data.isPod ? String(totalDesc) : String(totalDesc);
-
-          // If no children at all, hide content
-          if (totalDesc <= 0) return `<div style="display:none"></div>`;
-
-          return `
-            <div style="
-              width:34px;height:22px;
-              border-radius:999px;
-              background:white;
-              border:1px solid rgba(17,24,39,0.18);
-              box-shadow:0 6px 16px rgba(0,0,0,0.08);
-              display:flex;align-items:center;justify-content:center;
-              font-size:12px;font-weight:900;color:#111827;
-            ">
-              ${label}
-            </div>
-          `;
-        })
-
-        // Clicking behavior:
-        // - Pod mode: clicking pod header toggles expand for entire pod
-        // - Normal mode: default expand/collapse node
-        .onNodeClick((d: any) => {
-          const data: NodeData = d.data;
-          if (data.isPod && data.podKey) {
-            setExpandedPods((prev) => ({ ...prev, [data.podKey!]: !prev[data.podKey!] }));
-            return;
-          }
-        })
-
-        .nodeContent((d: any) => {
-          const p: NodeData = d.data;
-
-          // POD HEADER CARD
-          if (p.isPod) {
-            return `
-              <div style="
-                width:360px;height:90px;
-                background:${LILAC_BG};
-                border:1px solid ${BORDER};
-                border-radius:18px;
-                box-shadow:0 10px 22px rgba(0,0,0,0.06);
-                display:flex;align-items:center;justify-content:center;
-                position:relative; overflow:hidden;
-              ">
-                <div style="position:absolute;left:0;top:0;bottom:0;width:7px;background:${LILAC};"></div>
-                <div style="
-                  font-weight:950;
-                  font-size:20px;
-                  color:#111827;
-                  padding:0 18px;
-                  text-align:center;
-                  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-                  max-width:330px;
-                ">
-                  ${p.name}
-                </div>
-              </div>
-            `;
-          }
-
-          // PERSON CARD
-          const img = p.photoUrl
-            ? `<img src="${p.photoUrl}" crossorigin="anonymous"
-                 style="width:76px;height:76px;border-radius:18px;object-fit:cover;border:1px solid rgba(0,0,0,0.12)" />`
-            : `<div style="width:76px;height:76px;border-radius:18px;background:rgba(0,0,0,0.06);
-                 display:flex;align-items:center;justify-content:center;font-weight:900;font-size:22px;">
-                 ${(p.name || "?").trim().slice(0, 1).toUpperCase()}
-               </div>`;
-
-          // team, location, email only (4 lines as you want)
-          return `
-            <div style="
-              width:520px;height:130px;
-              background:#fff;
-              border:1px solid ${BORDER};
-              border-radius:22px;
-              box-shadow:0 12px 26px rgba(0,0,0,0.06);
-              padding:16px 16px;
-              display:flex;gap:14px;align-items:center;
-              position:relative; overflow:hidden;
-            ">
-              <div style="position:absolute;left:0;top:0;bottom:0;width:7px;background:${LILAC};"></div>
-
-              ${img}
-
-              <div style="display:flex;flex-direction:column;gap:6px;min-width:0;flex:1;">
-                <div style="
-                  font-weight:950;font-size:22px;line-height:1.1;color:#111827;
-                  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-                ">
-                  ${p.name}
-                </div>
-
-                <div style="
-                  font-size:16px;font-weight:850;color:#111827;
-                  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-                ">
-                  ${p.team || ""}
-                </div>
-
-                <div style="
-                  font-size:15px;font-weight:800;color:#374151;
-                  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-                ">
-                  ${p.location || ""}
-                </div>
-
-                <div style="
-                  font-size:14px;font-weight:800;color:#6B7280;
-                  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-                ">
-                  ${p.email || ""}
-                </div>
-              </div>
-
-              ${
-                p.pod
-                  ? `
-                <div style="
-                  position:absolute; top:10px; right:12px;
-                  font-size:13px; font-weight:950;
-                  color:${LILAC};
-                  background:${LILAC_BG};
-                  border:1px solid rgba(109,40,217,0.20);
-                  padding:6px 12px;
-                  border-radius:999px;
-                  max-width:220px;
-                  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-                ">
-                  ${p.pod}
-                </div>`
-                  : ""
-              }
-            </div>
-          `;
-        })
-
-        .render();
-
-      chartObjRef.current = chart;
-      chart.fit();
-    })();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [nodes]);
-
+  /**
+   * Upload CSV (edit mode)
+   */
   async function uploadCsvToServer(file: File) {
     setError("");
 
@@ -469,18 +209,185 @@ export default function ClientPage() {
       return;
     }
 
-    // Reload
     const csv = await (await fetch("/api/org")).text();
     Papa.parse<RawRow>(csv, {
       header: true,
       skipEmptyLines: true,
-      complete: (r) => {
-        const mapped = ((r.data || []) as RawRow[]).map(toRow);
-        setRows(mapped.filter((x) => x.Name.trim() !== ""));
-      },
-      error: (err: unknown) => setError(err instanceof Error ? err.message : String(err)),
+      complete: (r) => setRows((r.data || []) as RawRow[]),
+      error: (err: unknown) =>
+        setError(err instanceof Error ? err.message : String(err)),
     });
   }
+
+  /**
+   * Render chart
+   */
+  useEffect(() => {
+    if (!chartRef.current) return;
+
+    if (!chartData.length) {
+      chartRef.current.innerHTML = "";
+      return;
+    }
+
+    chartRef.current.innerHTML = "";
+    let cancelled = false;
+
+    (async () => {
+      const mod = await import("d3-org-chart");
+      const OrgChart = (mod as any).OrgChart;
+
+      if (cancelled || !chartRef.current) return;
+
+      const chart = new OrgChart()
+        .container(chartRef.current)
+        .data(chartData)
+        .nodeWidth(() => 360)
+        .nodeHeight(() => 150) // prevent overlap with button
+        .childrenMargin(() => 60)
+        .compactMarginBetween(() => 40)
+        .compactMarginPair(() => 90)
+        // Button number = TOTAL descendants (not just direct children)
+        .buttonContent((d: any) => {
+          // d has .data.id
+          const id = d?.data?.id as string;
+          if (!id) return "";
+          const allDesc = hierarchyIndex.getDescendants(id);
+
+          if (mode === "pod" && selectedPod) {
+            // count only descendants within selected pod
+            const inPod = allDesc.filter((x) => hierarchyIndex.byId.get(x)?.pod === selectedPod);
+            return `${inPod.length}`;
+          }
+
+          return `${allDesc.length}`;
+        })
+        // Fix button overlap a bit (move it down)
+        .nodeUpdate(function (this: any, d: any) {
+          // `this` is node group
+          try {
+            // move the expand button group slightly down
+            // (safe: if selection/class names change, this just no-ops)
+            const g = this.querySelector?.(".node-button-g");
+            if (g) g.setAttribute("transform", "translate(0, 22)");
+          } catch {}
+        })
+        .nodeContent((d: any) => {
+          const p = d.data as any;
+
+          const podBadge =
+            p.pod && p.pod.trim()
+              ? `
+                <div style="
+                  position:absolute; right:14px; top:12px;
+                  font-size:12px;font-weight:900;
+                  color:${LILAC}; background:${LILAC_BG};
+                  border:1px solid rgba(109,40,217,0.25);
+                  padding:4px 10px;border-radius:999px;
+                  max-width:160px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+                ">
+                  ${p.pod}
+                </div>
+              `
+              : "";
+
+          const img = p.photoUrl
+            ? `<img src="${p.photoUrl}" crossorigin="anonymous"
+                 style="width:72px;height:72px;border-radius:18px;object-fit:cover;border:1px solid rgba(0,0,0,0.10)" />`
+            : `<div style="width:72px;height:72px;border-radius:18px;background:rgba(0,0,0,0.06);
+                 display:flex;align-items:center;justify-content:center;font-weight:900;">
+                 ${String(p.name).trim().slice(0, 1).toUpperCase()}
+               </div>`;
+
+          return `
+            <div style="
+              width:360px;height:150px;background:#fff;
+              border:1px solid rgba(0,0,0,0.12);
+              border-radius:22px;
+              box-shadow:0 10px 26px rgba(0,0,0,0.07);
+              padding:14px 14px 14px 14px;
+              display:flex;gap:14px;align-items:center;
+              position:relative;
+              overflow:hidden;
+            ">
+              <div style="position:absolute;left:0;top:0;bottom:0;width:7px;background:${LILAC};"></div>
+              ${podBadge}
+              ${img}
+              <div style="display:flex;flex-direction:column;gap:8px;min-width:0;flex:1;padding-right:10px;">
+                <div style="
+                  font-weight:950;font-size:22px;line-height:1.1;color:#111827;
+                  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+                ">
+                  ${p.name}
+                </div>
+
+                <div style="
+                  font-size:14px;font-weight:900;color:#111827;
+                  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+                ">
+                  ${p.team || ""}
+                </div>
+
+                <div style="
+                  font-size:14px;font-weight:800;color:#374151;
+                  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+                ">
+                  ${p.location || ""}
+                </div>
+
+                <div style="
+                  font-size:14px;font-weight:800;color:#6B7280;
+                  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+                ">
+                  ${p.email || ""}
+                </div>
+              </div>
+            </div>
+          `;
+        })
+        .render();
+
+      chartObjRef.current = chart;
+
+      // POD MODE: auto-expand everyone in selected pod
+      if (mode === "pod" && selectedPod) {
+        try {
+          // Expand all nodes that are in selected pod AND their ancestors (to make reachable)
+          const inPodIds = people.filter((p) => p.pod === selectedPod).map((p) => p.id);
+          const toExpand = new Set<string>();
+
+          // Expand all ancestors of in-pod nodes
+          for (const id of inPodIds) {
+            let cur = hierarchyIndex.byId.get(id);
+            while (cur?.parentId) {
+              toExpand.add(cur.parentId);
+              cur = hierarchyIndex.byId.get(cur.parentId);
+            }
+          }
+
+          // Expand the in-pod managers too (so their children open)
+          for (const id of inPodIds) toExpand.add(id);
+
+          // best-effort API (depends on d3-org-chart version)
+          if (typeof chart.setExpanded === "function") {
+            for (const id of toExpand) chart.setExpanded(id, true);
+            chart.render();
+          } else if (typeof chart.expand === "function") {
+            for (const id of toExpand) chart.expand(id);
+          } else {
+            // fallback
+            chart.expandAll?.();
+          }
+        } catch {
+          // ignore
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [chartData, mode, selectedPod, hierarchyIndex, people]);
 
   return (
     <div style={{ padding: 20, fontFamily: "system-ui, -apple-system, Segoe UI, Roboto" }}>
@@ -488,7 +395,7 @@ export default function ClientPage() {
         Aspora Organisational Chart
       </h1>
 
-      <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 12, flexWrap: "wrap" }}>
+      <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 12, flexWrap: "wrap" }}>
         {isEdit && (
           <input
             type="file"
@@ -501,19 +408,17 @@ export default function ClientPage() {
                 return;
               }
               await uploadCsvToServer(file);
-              // reset input so choosing the same file again works
-              e.currentTarget.value = "";
             }}
           />
         )}
 
         <button
-          onClick={() => setLayout("hierarchy")}
+          onClick={() => setMode("hierarchy")}
           style={{
             padding: "8px 12px",
             borderRadius: 10,
             border: "1px solid rgba(0,0,0,0.12)",
-            background: layout === "hierarchy" ? LILAC_BG : "white",
+            background: mode === "hierarchy" ? LILAC_BG : "white",
             fontWeight: 900,
           }}
         >
@@ -521,17 +426,37 @@ export default function ClientPage() {
         </button>
 
         <button
-          onClick={() => setLayout("pods")}
+          onClick={() => setMode("pod")}
           style={{
             padding: "8px 12px",
             borderRadius: 10,
             border: "1px solid rgba(0,0,0,0.12)",
-            background: layout === "pods" ? LILAC_BG : "white",
+            background: mode === "pod" ? LILAC_BG : "white",
             fontWeight: 900,
           }}
         >
-          Pods
+          Pod
         </button>
+
+        {mode === "pod" && (
+          <select
+            value={selectedPod}
+            onChange={(e) => setSelectedPod(e.target.value)}
+            style={{
+              padding: "8px 12px",
+              borderRadius: 10,
+              border: "1px solid rgba(0,0,0,0.12)",
+              fontWeight: 800,
+            }}
+          >
+            <option value="">Select pod…</option>
+            {pods.map((p) => (
+              <option key={p} value={p}>
+                {p}
+              </option>
+            ))}
+          </select>
+        )}
 
         <button onClick={() => chartObjRef.current?.fit()} style={{ padding: "8px 12px" }}>
           Fit
@@ -562,7 +487,8 @@ export default function ClientPage() {
       </div>
 
       <div style={{ marginTop: 10, opacity: 0.7, fontSize: 12 }}>
-        CSV headers expected: Name, Work Email, Manager Email, Team, Location, Photo URL (optional: Pod).
+        CSV headers accepted: Name/Full Name, Work Email/Email, Manager Email/Manager Work Email, Team/Department,
+        Location/Country, Photo URL/Photo, Pod/POD.
       </div>
     </div>
   );
