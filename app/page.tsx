@@ -3,6 +3,8 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import Papa from "papaparse";
 
+type RawRow = Record<string, any>;
+
 type Row = {
   Name: string;
   "Work Email": string;
@@ -23,13 +25,24 @@ type NodeData = {
   photoUrl: string;
   pod?: string;
 
-  // virtual nodes
+  // flags
   isPod?: boolean;
-  podTotal?: number;
+  podKey?: string;
+
+  // expansion
+  _expanded?: boolean;
 };
+
+const LILAC = "#6D28D9";
+const LILAC_BG = "#F5F3FF";
+const BORDER = "rgba(17,24,39,0.14)"; // slate-ish
 
 function normalizeEmail(v: string) {
   return (v || "").trim().toLowerCase();
+}
+
+function normalizeText(v: string) {
+  return String(v ?? "").trim();
 }
 
 function ensureHttps(url: string) {
@@ -39,125 +52,113 @@ function ensureHttps(url: string) {
   return `https://${u}`;
 }
 
-// ---- CSV header aliases (senin sheet bazen Job Title / Manager Name vb ekliyor)
-// Biz sadece lazım olanları map’liyoruz. ----
-const HEADER_ALIASES: Record<keyof Row, string[]> = {
-  Name: ["Name", "Full Name"],
-  "Work Email": ["Work Email", "Email", "Work email"],
-  "Manager Email": ["Manager Email", "Manager email", "Reports To Email", "Manager Email Address"],
-  Team: ["Team", "Department"],
-  Location: ["Location", "Country", "Office", "Country/Location"],
-  "Photo URL": ["Photo URL", "Photo", "PhotoURL", "Image", "Image URL"],
-  Pod: ["Pod", "POD", "Product Pod", "Squad"],
-};
+/**
+ * Header aliases:
+ * Your CSV now can contain e.g. Job Title / Manager Name etc.
+ * We only map what we need, with flexible column names.
+ */
+function toRow(r: RawRow): Row {
+  const get = (...keys: string[]) => {
+    for (const k of keys) {
+      if (r[k] !== undefined && r[k] !== null && String(r[k]).trim() !== "") return r[k];
+    }
+    return "";
+  };
 
-function pickField(obj: Record<string, any>, keys: string[]) {
-  for (const k of keys) {
-    if (k in obj) return obj[k];
-  }
-  return "";
+  return {
+    Name: normalizeText(get("Name", "Full Name")),
+    "Work Email": normalizeText(get("Work Email", "Email", "Work email", "WorkEmail")),
+    "Manager Email": normalizeText(get("Manager Email", "ManagerEmail", "Manager E-mail")),
+    Team: normalizeText(get("Team", "Department", "Function")),
+    Location: normalizeText(get("Location", "Country", "Office", "Region")),
+    "Photo URL": normalizeText(get("Photo URL", "Photo", "PhotoURL", "Photo Url")),
+    Pod: normalizeText(get("Pod", "POD", "Squad", "Tribe")),
+  };
 }
 
-function parseCsvTextToRows(text: string): { rows: Row[]; error?: string } {
-  const parsed = Papa.parse<Record<string, any>>(text, {
-    header: true,
-    skipEmptyLines: true,
-  });
-
-  if (parsed.errors?.length) {
-    return { rows: [], error: parsed.errors[0]?.message || "CSV parse error" };
-  }
-
-  const data = (parsed.data || []) as Record<string, any>[];
-
-  const rows: Row[] = data.map((r) => {
-    const mapped: Row = {
-      Name: String(pickField(r, HEADER_ALIASES.Name) ?? "").trim(),
-      "Work Email": String(pickField(r, HEADER_ALIASES["Work Email"]) ?? "").trim(),
-      "Manager Email": String(pickField(r, HEADER_ALIASES["Manager Email"]) ?? "").trim(),
-      Team: String(pickField(r, HEADER_ALIASES.Team) ?? "").trim(),
-      Location: String(pickField(r, HEADER_ALIASES.Location) ?? "").trim(),
-      "Photo URL": String(pickField(r, HEADER_ALIASES["Photo URL"]) ?? "").trim(),
-      Pod: String(pickField(r, HEADER_ALIASES.Pod) ?? "").trim(),
-    };
-    return mapped;
-  });
-
-  // basic validation: Name zorunlu
-  for (let i = 0; i < rows.length; i++) {
-    if (!rows[i].Name) return { rows: [], error: `Row ${i + 2}: Name is empty` };
-  }
-
-  return { rows };
+function requiredColsMissing(headers: string[]) {
+  // We require at least these columns (Pod optional)
+  const required = ["Name", "Work Email", "Manager Email", "Team", "Location", "Photo URL"];
+  const set = new Set(headers);
+  // allow aliases by accepting any header set that includes at least one of the key variants:
+  // We'll enforce after parsing by checking Row fields too.
+  return required.filter((c) => !set.has(c));
 }
+
+type LayoutMode = "hierarchy" | "pods";
 
 export default function ClientPage() {
   const chartRef = useRef<HTMLDivElement | null>(null);
   const chartObjRef = useRef<any>(null);
 
   const [isEdit, setIsEdit] = useState(false);
-  const [layout, setLayout] = useState<"hierarchy" | "pods">("hierarchy");
+  const [layout, setLayout] = useState<LayoutMode>("hierarchy");
 
   const [rows, setRows] = useState<Row[]>([]);
   const [error, setError] = useState<string>("");
-  const [status, setStatus] = useState<string>("");
+
+  // which pods are expanded in pod mode
+  const [expandedPods, setExpandedPods] = useState<Record<string, boolean>>({});
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     setIsEdit(params.get("edit") === "1");
-    const l = params.get("layout");
-    if (l === "pods") setLayout("pods");
   }, []);
 
-  // Load shared CSV on first load
+  // Load shared CSV
   useEffect(() => {
-    setStatus("Loading…");
     fetch("/api/org")
       .then(async (r) => {
         if (!r.ok) throw new Error(await r.text());
         return r.text();
       })
       .then((text) => {
-        const res = parseCsvTextToRows(text);
-        if (res.error) {
-          setError(res.error);
-          setRows([]);
-          setStatus("");
-          return;
-        }
-        setError("");
-        setRows(res.rows);
-        setStatus(`Loaded ${res.rows.length} people`);
+        Papa.parse<RawRow>(text, {
+          header: true,
+          skipEmptyLines: true,
+          complete: (res) => {
+            const raw = (res.data || []) as RawRow[];
+            const mapped = raw.map(toRow);
+
+            // basic sanity: Name required
+            const cleaned = mapped.filter((x) => x.Name.trim() !== "");
+            setRows(cleaned);
+          },
+          error: (err: unknown) => setError(err instanceof Error ? err.message : String(err)),
+        });
       })
       .catch(() => {
-        setStatus("No CSV uploaded yet (normal).");
+        // first run normal
       });
   }, []);
 
-  // Build person nodes (hierarchy base)
-  const personNodes: NodeData[] = useMemo(() => {
+  // Build base "people nodes" once
+  const peopleNodes: NodeData[] = useMemo(() => {
     const built = rows.map((r, i) => {
-      const workEmail = String(r["Work Email"] || "").trim();
-      const name = String(r.Name || "").trim();
-      const id = workEmail ? normalizeEmail(workEmail) : `row:${i}:${name.toLowerCase()}`;
+      const email = normalizeEmail(r["Work Email"]);
+      const name = normalizeText(r.Name);
+
+      const id = email || `name:${name.toLowerCase()}:${i}`;
+
+      const photo =
+        ensureHttps(r["Photo URL"] || "") ||
+        `https://ui-avatars.com/api/?background=eee&color=555&name=${encodeURIComponent(
+          name || "User"
+        )}`;
 
       return {
         id,
         parentId: normalizeEmail(r["Manager Email"]) || null,
-        name: name || workEmail || "(no name)",
-        email: workEmail,
-        team: (r.Team || "").trim(),
-        location: (r.Location || "").trim(),
-        pod: (r.Pod || "").trim(),
-        photoUrl:
-          ensureHttps(r["Photo URL"] || "") ||
-          `https://ui-avatars.com/api/?background=ede9fe&color=4c1d95&name=${encodeURIComponent(
-            name || "User"
-          )}`,
+        name: name || email || "(no name)",
+        email: normalizeText(r["Work Email"]),
+        team: normalizeText(r.Team),
+        location: normalizeText(r.Location),
+        photoUrl: photo,
+        pod: normalizeText(r.Pod || "") || undefined,
       };
     });
 
-    // If manager not in dataset, parentId null
+    // Fix parentId if manager missing from dataset (becomes root)
     const ids = new Set(built.map((n) => n.id));
     return built.map((n) => ({
       ...n,
@@ -165,63 +166,101 @@ export default function ClientPage() {
     }));
   }, [rows]);
 
-  // POD layout nodes:
-  // - create pod nodes under root(s)
-  // - keep hierarchy INSIDE pod when manager is same pod
-  // - if pod empty => do NOT create "No Pod", keep normal hierarchy
+  // find root (CEO): the first node with parentId null
+  const rootId = useMemo(() => {
+    const r = peopleNodes.find((n) => n.parentId === null);
+    return r?.id || (peopleNodes[0]?.id ?? null);
+  }, [peopleNodes]);
+
+  /**
+   * POD MODE GRAPH:
+   * - Create virtual nodes: pod:<podKey>
+   * - CEO children become all pods (not "No Pod")
+   * - Inside each pod:
+   *    - keep manager->report relations ONLY if manager is in same pod
+   *    - otherwise attach person to pod node
+   * - Clicking pod should expand all inside that pod (we drive via expandedPods + _expanded flags)
+   */
   const nodes: NodeData[] = useMemo(() => {
-    if (layout === "hierarchy") return personNodes;
+    if (!peopleNodes.length) return [];
 
-    // find roots (CEO etc.)
-    const roots = personNodes.filter((n) => !n.parentId).map((n) => n.id);
-    const globalRoot = roots.length ? roots[0] : null;
-
-    // pod totals
-    const podTotals = new Map<string, number>();
-    for (const n of personNodes) {
-      const p = (n.pod || "").trim();
-      if (!p) continue;
-      podTotals.set(p, (podTotals.get(p) || 0) + 1);
+    if (layout === "hierarchy") {
+      // plain hierarchy
+      return peopleNodes.map((n) => ({ ...n }));
     }
 
-    // create pod nodes under global root (if none, they become roots)
-    const podNodes: NodeData[] = Array.from(podTotals.entries())
-      .sort((a, b) => a[0].localeCompare(b[0]))
-      .map(([podName, total]) => ({
-        id: `pod:${podName.toLowerCase()}`,
-        parentId: globalRoot, // if null => root
-        name: podName,
+    // pods layout
+    const root = rootId;
+    if (!root) return peopleNodes.map((n) => ({ ...n }));
+
+    const byId = new Map<string, NodeData>();
+    for (const n of peopleNodes) byId.set(n.id, n);
+
+    // gather pods (exclude empty)
+    const pods = Array.from(
+      new Set(
+        peopleNodes
+          .map((n) => normalizeText(n.pod || ""))
+          .map((x) => x.trim())
+          .filter((x) => x.length > 0)
+      )
+    ).sort((a, b) => a.localeCompare(b));
+
+    // virtual pod nodes
+    const podNodes: NodeData[] = pods.map((p) => {
+      const key = p; // already a label
+      return {
+        id: `pod:${key.toLowerCase()}`,
+        parentId: root, // all pods under CEO
+        name: key,
         email: "",
         team: "",
         location: "",
         photoUrl: "",
         isPod: true,
-        podTotal: total,
-      }));
-
-    const byId = new Map(personNodes.map((n) => [n.id, n]));
-    const podIdByName = new Map<string, string>();
-    for (const p of podNodes) podIdByName.set(p.name, p.id);
-
-    const remappedPeople: NodeData[] = personNodes.map((n) => {
-      const podName = (n.pod || "").trim();
-      if (!podName) return n; // keep original hierarchy if no pod
-
-      const manager = n.parentId ? byId.get(n.parentId) : null;
-      const managerPod = (manager?.pod || "").trim();
-
-      // If manager is same pod -> keep as is (under manager)
-      if (manager && managerPod === podName) return n;
-
-      // else attach to pod node
-      return {
-        ...n,
-        parentId: podIdByName.get(podName) || n.parentId,
+        podKey: key,
+        _expanded: !!expandedPods[key],
       };
     });
 
-    return [...podNodes, ...remappedPeople];
-  }, [layout, personNodes]);
+    const podIdByKey = new Map<string, string>();
+    for (const pn of podNodes) podIdByKey.set(pn.podKey!, pn.id);
+
+    // Assign people under pods
+    const peopleInPod: NodeData[] = peopleNodes.map((n) => {
+      const podKey = (n.pod || "").trim();
+      if (!podKey) {
+        // No pod: keep in original hierarchy (CEO etc.)
+        return { ...n };
+      }
+
+      const managerId = n.parentId;
+      const manager = managerId ? byId.get(managerId) : null;
+      const samePodManager = manager && (manager.pod || "").trim() === podKey;
+
+      // If manager is same pod, keep original parentId
+      // Else attach to pod node
+      const parentId = samePodManager ? managerId : podIdByKey.get(podKey)!;
+
+      // expansion rule: if pod is expanded, expand everything under it
+      const expanded = !!expandedPods[podKey];
+
+      return {
+        ...n,
+        parentId,
+        _expanded: expanded ? true : undefined,
+      };
+    });
+
+    // Important: CEO should remain the root visible node.
+    // If CEO has a Pod in CSV, we still keep CEO as root (not inside pod).
+    // So force root node to have parentId null.
+    const final = [...podNodes, ...peopleInPod].map((n) =>
+      n.id === root ? { ...n, parentId: null } : n
+    );
+
+    return final;
+  }, [peopleNodes, layout, expandedPods, rootId]);
 
   // Render chart
   useEffect(() => {
@@ -233,161 +272,188 @@ export default function ClientPage() {
     }
 
     chartRef.current.innerHTML = "";
+
     let cancelled = false;
 
     (async () => {
-      try {
-        const mod = await import("d3-org-chart");
-        const OrgChart = (mod as any).OrgChart;
-        if (cancelled || !chartRef.current) return;
+      const mod = await import("d3-org-chart");
+      const OrgChart = (mod as any).OrgChart;
 
-        const LILAC = "#6D28D9";
-        const LILAC_BG = "#F5F3FF";
+      if (cancelled || !chartRef.current) return;
 
-        const chart = new OrgChart()
-          .container(chartRef.current)
-          .data(nodes)
-          .nodeWidth((d: any) => (d.data?.isPod ? 360 : 360))
-          .nodeHeight((d: any) => (d.data?.isPod ? 90 : 124))
-          .childrenMargin(() => 55)
-          .compactMarginBetween(() => 30)
-          .compactMarginPair(() => 80)
+      const chart = new OrgChart()
+        .container(chartRef.current)
+        .data(nodes)
+        .nodeWidth((d: any) => (d.data?.isPod ? 360 : 520))
+        // Make node taller so the expand button sits UNDER the card, not on top of text
+        .nodeHeight((d: any) => (d.data?.isPod ? 120 : 190))
+        .childrenMargin(() => 60)
+        .compactMarginBetween(() => 40)
+        .compactMarginPair(() => 90)
 
-          // IMPORTANT: button label (pod’da total göster)
-          .buttonContent((d: any) => {
-            const data = d.data || {};
-            const label =
-              data.isPod && typeof data.podTotal === "number"
-                ? String(data.podTotal)
-                : String(d.children?.length || 0);
+        // Show TOTAL descendants count (not just direct children)
+        .buttonContent((d: any) => {
+          const data: NodeData = d.data;
 
-            // küçük pill — overlap olmasın diye biraz daha aşağıda dursun
+          // total descendants excluding self
+          const totalDesc = (d.descendants?.()?.length ?? 1) - 1;
+
+          // For pod node, show pod total people count (descendants excluding pod node)
+          const label = data.isPod ? String(totalDesc) : String(totalDesc);
+
+          // If no children at all, hide content
+          if (totalDesc <= 0) return `<div style="display:none"></div>`;
+
+          return `
+            <div style="
+              width:34px;height:22px;
+              border-radius:999px;
+              background:white;
+              border:1px solid rgba(17,24,39,0.18);
+              box-shadow:0 6px 16px rgba(0,0,0,0.08);
+              display:flex;align-items:center;justify-content:center;
+              font-size:12px;font-weight:900;color:#111827;
+            ">
+              ${label}
+            </div>
+          `;
+        })
+
+        // Clicking behavior:
+        // - Pod mode: clicking pod header toggles expand for entire pod
+        // - Normal mode: default expand/collapse node
+        .onNodeClick((d: any) => {
+          const data: NodeData = d.data;
+          if (data.isPod && data.podKey) {
+            setExpandedPods((prev) => ({ ...prev, [data.podKey!]: !prev[data.podKey!] }));
+            return;
+          }
+        })
+
+        .nodeContent((d: any) => {
+          const p: NodeData = d.data;
+
+          // POD HEADER CARD
+          if (p.isPod) {
             return `
               <div style="
-                transform: translateY(8px);
-                background: white;
-                border: 1px solid rgba(0,0,0,0.12);
-                border-radius: 8px;
-                padding: 2px 6px;
-                font-size: 12px;
-                font-weight: 800;
-                color: #111827;
-                box-shadow: 0 2px 8px rgba(0,0,0,0.06);
-                min-width: 22px;
-                text-align: center;
-              ">${label}</div>
-            `;
-          })
-
-          .nodeContent((d: any) => {
-            const p: NodeData = d.data;
-
-            // POD NODE (no "x people" text)
-            if (p.isPod) {
-              return `
-                <div style="
-                  width:360px;height:90px;background:${LILAC_BG};
-                  border:1px solid rgba(0,0,0,0.10);
-                  border-radius:18px;box-shadow:0 6px 18px rgba(0,0,0,0.06);
-                  display:flex;align-items:center;justify-content:center;
-                  position:relative; overflow:hidden;
-                  padding-bottom:16px;
-                ">
-                  <div style="position:absolute;left:0;top:0;bottom:0;width:6px;background:${LILAC};"></div>
-                  <div style="
-                    font-weight:900;font-size:18px;color:#111827;
-                    padding:0 16px; text-align:center;
-                    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:340px;
-                  ">
-                    ${p.name}
-                  </div>
-                </div>
-              `;
-            }
-
-            const img = p.photoUrl
-              ? `<img src="${p.photoUrl}" crossorigin="anonymous"
-                     style="width:64px;height:64px;border-radius:16px;object-fit:cover;border:1px solid rgba(0,0,0,0.12)" />`
-              : `<div style="width:64px;height:64px;border-radius:16px;background:rgba(0,0,0,0.06);
-                     display:flex;align-items:center;justify-content:center;font-weight:800;">
-                   ${String(p.name).trim().slice(0, 1).toUpperCase()}
-                 </div>`;
-
-            return `
-              <div style="
-                width:360px;height:124px;background:#fff;border:1px solid rgba(0,0,0,0.12);
-                border-radius:18px;box-shadow:0 6px 18px rgba(0,0,0,0.06);
-                padding:14px;display:flex;gap:12px;align-items:center;
+                width:360px;height:90px;
+                background:${LILAC_BG};
+                border:1px solid ${BORDER};
+                border-radius:18px;
+                box-shadow:0 10px 22px rgba(0,0,0,0.06);
+                display:flex;align-items:center;justify-content:center;
                 position:relative; overflow:hidden;
-                padding-bottom:22px;
               ">
-                <div style="position:absolute;left:0;top:0;bottom:0;width:6px;background:${LILAC};"></div>
-
-                ${img}
-
-                <div style="display:flex;flex-direction:column;gap:6px;min-width:0;flex:1;">
-                  <div style="
-                    font-weight:950;font-size:16px;line-height:1.1;color:#111827;
-                    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-                  ">
-                    ${p.name}
-                  </div>
-
-                  <div style="font-size:13px;font-weight:800;color:#111827;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
-                    ${p.team}
-                  </div>
-
-                  <div style="font-size:12px;font-weight:800;color:#374151;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
-                    ${p.location}
-                  </div>
-
-                  <div style="font-size:12px;font-weight:800;color:#6B7280;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
-                    ${p.email}
-                  </div>
-
-                  ${
-                    p.pod
-                      ? `<div style="
-                          position:absolute; right:12px; top:12px;
-                          font-size:12px;font-weight:900;color:#4C1D95;
-                          background:#EDE9FE;border:1px solid rgba(76,29,149,0.15);
-                          padding:3px 9px;border-radius:999px;
-                          max-width:150px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-                        ">${p.pod}</div>`
-                      : ""
-                  }
+                <div style="position:absolute;left:0;top:0;bottom:0;width:7px;background:${LILAC};"></div>
+                <div style="
+                  font-weight:950;
+                  font-size:20px;
+                  color:#111827;
+                  padding:0 18px;
+                  text-align:center;
+                  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+                  max-width:330px;
+                ">
+                  ${p.name}
                 </div>
               </div>
             `;
-          })
-          .render();
+          }
 
-        chartObjRef.current = chart;
+          // PERSON CARD
+          const img = p.photoUrl
+            ? `<img src="${p.photoUrl}" crossorigin="anonymous"
+                 style="width:76px;height:76px;border-radius:18px;object-fit:cover;border:1px solid rgba(0,0,0,0.12)" />`
+            : `<div style="width:76px;height:76px;border-radius:18px;background:rgba(0,0,0,0.06);
+                 display:flex;align-items:center;justify-content:center;font-weight:900;font-size:22px;">
+                 ${(p.name || "?").trim().slice(0, 1).toUpperCase()}
+               </div>`;
 
-        // POD layout: daha pürüzsüz olsun diye ilk açılışta genişlet
-        if (layout === "pods") {
-          chart.expandAll();
-          chart.fit();
-        }
-      } catch (e: unknown) {
-        setError(e instanceof Error ? e.message : String(e));
-      }
+          // team, location, email only (4 lines as you want)
+          return `
+            <div style="
+              width:520px;height:130px;
+              background:#fff;
+              border:1px solid ${BORDER};
+              border-radius:22px;
+              box-shadow:0 12px 26px rgba(0,0,0,0.06);
+              padding:16px 16px;
+              display:flex;gap:14px;align-items:center;
+              position:relative; overflow:hidden;
+            ">
+              <div style="position:absolute;left:0;top:0;bottom:0;width:7px;background:${LILAC};"></div>
+
+              ${img}
+
+              <div style="display:flex;flex-direction:column;gap:6px;min-width:0;flex:1;">
+                <div style="
+                  font-weight:950;font-size:22px;line-height:1.1;color:#111827;
+                  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+                ">
+                  ${p.name}
+                </div>
+
+                <div style="
+                  font-size:16px;font-weight:850;color:#111827;
+                  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+                ">
+                  ${p.team || ""}
+                </div>
+
+                <div style="
+                  font-size:15px;font-weight:800;color:#374151;
+                  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+                ">
+                  ${p.location || ""}
+                </div>
+
+                <div style="
+                  font-size:14px;font-weight:800;color:#6B7280;
+                  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+                ">
+                  ${p.email || ""}
+                </div>
+              </div>
+
+              ${
+                p.pod
+                  ? `
+                <div style="
+                  position:absolute; top:10px; right:12px;
+                  font-size:13px; font-weight:950;
+                  color:${LILAC};
+                  background:${LILAC_BG};
+                  border:1px solid rgba(109,40,217,0.20);
+                  padding:6px 12px;
+                  border-radius:999px;
+                  max-width:220px;
+                  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+                ">
+                  ${p.pod}
+                </div>`
+                  : ""
+              }
+            </div>
+          `;
+        })
+
+        .render();
+
+      chartObjRef.current = chart;
+      chart.fit();
     })();
 
     return () => {
       cancelled = true;
     };
-  }, [nodes, layout]);
+  }, [nodes]);
 
   async function uploadCsvToServer(file: File) {
     setError("");
-    setStatus("Uploading…");
 
     const pw = prompt("Admin password?");
-    if (!pw) {
-      setStatus("");
-      return;
-    }
+    if (!pw) return;
 
     const fd = new FormData();
     fd.append("file", file);
@@ -400,24 +466,20 @@ export default function ClientPage() {
 
     if (!res.ok) {
       setError(`Upload failed: ${await res.text()}`);
-      setStatus("");
       return;
     }
 
-    // Always reload from shared source
-    const again = await fetch("/api/org");
-    const text = await again.text();
-    const parsed = parseCsvTextToRows(text);
-
-    if (parsed.error) {
-      setError(parsed.error);
-      setRows([]);
-      setStatus("");
-      return;
-    }
-
-    setRows(parsed.rows);
-    setStatus(`Loaded ${parsed.rows.length} people`);
+    // Reload
+    const csv = await (await fetch("/api/org")).text();
+    Papa.parse<RawRow>(csv, {
+      header: true,
+      skipEmptyLines: true,
+      complete: (r) => {
+        const mapped = ((r.data || []) as RawRow[]).map(toRow);
+        setRows(mapped.filter((x) => x.Name.trim() !== ""));
+      },
+      error: (err: unknown) => setError(err instanceof Error ? err.message : String(err)),
+    });
   }
 
   return (
@@ -426,7 +488,7 @@ export default function ClientPage() {
         Aspora Organisational Chart
       </h1>
 
-      <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 12, flexWrap: "wrap" }}>
+      <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 12, flexWrap: "wrap" }}>
         {isEdit && (
           <input
             type="file"
@@ -434,15 +496,12 @@ export default function ClientPage() {
             onChange={async (e) => {
               const file = e.target.files?.[0];
               if (!file) return;
-
               if (!file.name.toLowerCase().endsWith(".csv")) {
                 setError("Please upload a .csv file.");
                 return;
               }
-
               await uploadCsvToServer(file);
-
-              // reset input (normal)
+              // reset input so choosing the same file again works
               e.currentTarget.value = "";
             }}
           />
@@ -453,8 +512,8 @@ export default function ClientPage() {
           style={{
             padding: "8px 12px",
             borderRadius: 10,
-            border: layout === "hierarchy" ? "2px solid #6D28D9" : "1px solid rgba(0,0,0,0.12)",
-            background: layout === "hierarchy" ? "#F5F3FF" : "white",
+            border: "1px solid rgba(0,0,0,0.12)",
+            background: layout === "hierarchy" ? LILAC_BG : "white",
             fontWeight: 900,
           }}
         >
@@ -466,8 +525,8 @@ export default function ClientPage() {
           style={{
             padding: "8px 12px",
             borderRadius: 10,
-            border: layout === "pods" ? "2px solid #6D28D9" : "1px solid rgba(0,0,0,0.12)",
-            background: layout === "pods" ? "#F5F3FF" : "white",
+            border: "1px solid rgba(0,0,0,0.12)",
+            background: layout === "pods" ? LILAC_BG : "white",
             fontWeight: 900,
           }}
         >
@@ -485,16 +544,8 @@ export default function ClientPage() {
         </button>
       </div>
 
-      {status ? (
-        <div style={{ marginBottom: 10, fontSize: 12, fontWeight: 800, color: "#4B5563" }}>
-          {status}
-        </div>
-      ) : null}
-
       {error ? (
-        <div style={{ color: "#b00020", fontWeight: 900, marginBottom: 12 }}>
-          {error}
-        </div>
+        <div style={{ color: "#b00020", fontWeight: 800, marginBottom: 12 }}>{error}</div>
       ) : null}
 
       <div
@@ -510,8 +561,8 @@ export default function ClientPage() {
         <div ref={chartRef} />
       </div>
 
-      <div style={{ marginTop: 10, opacity: 0.75, fontSize: 12 }}>
-        CSV should include at least Name + Work Email + Manager Email + Team + Location + Photo URL. Pod is optional.
+      <div style={{ marginTop: 10, opacity: 0.7, fontSize: 12 }}>
+        CSV headers expected: Name, Work Email, Manager Email, Team, Location, Photo URL (optional: Pod).
       </div>
     </div>
   );
