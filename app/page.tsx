@@ -3,37 +3,34 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import Papa from "papaparse";
 
-type RawRow = Record<string, string | undefined>;
+type Row = {
+  Name: string;
+  "Work Email": string;
+  "Manager Email": string;
+  Team: string;
+  Location: string;
+  "Photo URL": string;
+  Pod?: string;
+};
 
-type PersonNode = {
+type NodeT = {
   id: string;
   parentId: string | null;
   name: string;
   email: string;
   team: string;
   location: string;
-  pod: string;
   photoUrl: string;
-  isPod?: false;
-  // d3-org-chart uses this for expansion state
-  _expanded?: boolean;
+  pod: string;
+  isPod?: boolean;
 };
 
-type PodNode = {
-  id: string; // e.g. "pod:Engineering"
-  parentId: string | null;
-  name: string; // e.g. "Engineering"
-  isPod: true;
-  podKey: string; // same as name but stable
-  _expanded?: boolean;
-};
-
-type AnyNode = PersonNode | PodNode;
+const LILAC = "#5B21B6";
+const LILAC_BG = "#F5F3FF";
 
 function normalizeEmail(v: string) {
   return (v || "").trim().toLowerCase();
 }
-
 function ensureHttps(url: string) {
   const u = (url || "").trim();
   if (!u) return "";
@@ -41,42 +38,85 @@ function ensureHttps(url: string) {
   return `https://${u}`;
 }
 
-// --- CSV header helpers (aliases) ---
-function pick(row: RawRow, keys: string[]) {
-  for (const k of keys) {
-    const v = row[k];
-    if (v !== undefined) return v;
+/** Case-insensitive getter for CSV headers */
+function getField(raw: Record<string, any>, candidates: string[]): string {
+  const lowerMap = new Map<string, string>();
+  for (const k of Object.keys(raw || {})) lowerMap.set(k.trim().toLowerCase(), k);
+
+  for (const c of candidates) {
+    const key = lowerMap.get(c.trim().toLowerCase());
+    if (key != null) return String(raw[key] ?? "").trim();
   }
   return "";
 }
 
-const COL = {
-  name: ["Name", "Full Name", "Employee Name"],
-  email: ["Work Email", "Email", "Work email", "Work Email Address"],
-  mgrEmail: ["Manager Email", "Manager Work Email", "Manager email", "Reports To Email"],
-  team: ["Team", "Department", "Function"],
-  location: ["Location", "Country", "Office"],
-  photo: ["Photo URL", "Photo", "PhotoURL", "Avatar", "Image"],
-  pod: ["Pod", "POD", "Squad", "Tribe"],
-};
+/** Normalize any CSV row into our Row shape (supports header aliases) */
+function normalizeRow(raw: Record<string, any>): Row {
+  const Name = getField(raw, ["Name", "Full Name"]);
+  const workEmail = getField(raw, ["Work Email", "Email", "WorkEmail", "Work e-mail"]);
+  const managerEmail = getField(raw, ["Manager Email", "ManagerEmail", "Manager e-mail"]);
+  const Team = getField(raw, ["Team", "Department"]);
+  const Location = getField(raw, ["Location", "Country", "Office"]);
+  const photo = getField(raw, ["Photo URL", "Photo", "PhotoURL", "Photo Url"]);
+  const pod = getField(raw, ["Pod", "POD", "pod"]);
 
-export default function Page() {
+  return {
+    Name,
+    "Work Email": workEmail,
+    "Manager Email": managerEmail,
+    Team,
+    Location,
+    "Photo URL": photo,
+    Pod: pod || "",
+  };
+}
+
+/** We only require headers to exist; values optional except Name. */
+function requiredColsMissing(headers: string[]) {
+  const required = ["name", "work email", "manager email", "team", "location", "photo url"];
+  const lower = new Set((headers || []).map((h) => h.trim().toLowerCase()));
+  return required.filter((c) => !lower.has(c));
+}
+
+/** compute descendant counts for buttonContent */
+function computeDescCounts(nodes: NodeT[]): Map<string, number> {
+  const children = new Map<string, string[]>();
+  for (const n of nodes) {
+    if (!n.parentId) continue;
+    if (!children.has(n.parentId)) children.set(n.parentId, []);
+    children.get(n.parentId)!.push(n.id);
+  }
+
+  const memo = new Map<string, number>();
+  const dfs = (id: string): number => {
+    if (memo.has(id)) return memo.get(id)!;
+    const kids = children.get(id) || [];
+    let sum = 0;
+    for (const k of kids) sum += 1 + dfs(k);
+    memo.set(id, sum);
+    return sum;
+  };
+
+  for (const n of nodes) dfs(n.id);
+  return memo;
+}
+
+export default function ClientPage() {
   const chartRef = useRef<HTMLDivElement | null>(null);
   const chartObjRef = useRef<any>(null);
 
   const [isEdit, setIsEdit] = useState(false);
-  const [layout, setLayout] = useState<"hierarchy" | "pod">("hierarchy");
-  const [rows, setRows] = useState<RawRow[]>([]);
-  const [error, setError] = useState<string>("");
+  const [rows, setRows] = useState<Row[]>([]);
+  const [error, setError] = useState("");
+  const [view, setView] = useState<"hierarchy" | "pods">("hierarchy");
 
-  // edit mode: ?edit=1
+  // client-side only query param (no Suspense needed)
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     setIsEdit(params.get("edit") === "1");
-    setLayout((params.get("view") as any) === "pod" ? "pod" : "hierarchy");
   }, []);
 
-  // load CSV from server on first load
+  // Load shared CSV from server on first load
   useEffect(() => {
     fetch("/api/org")
       .then(async (r) => {
@@ -84,56 +124,51 @@ export default function Page() {
         return r.text();
       })
       .then((text) => {
-        Papa.parse<RawRow>(text, {
+        Papa.parse<Record<string, any>>(text, {
           header: true,
           skipEmptyLines: true,
-          complete: (res) => setRows((res.data || []) as RawRow[]),
+          complete: (res) => {
+            const data = (res.data || []).map((raw) => normalizeRow(raw));
+            setRows(data);
+          },
           error: (err: unknown) =>
             setError(err instanceof Error ? err.message : String(err)),
         });
       })
       .catch(() => {
-        // first run: no file yet (ok)
+        // First run: no CSV uploaded yet (normal)
       });
   }, []);
 
-  // build PERSON nodes (pure hierarchy)
-  const personNodes: PersonNode[] = useMemo(() => {
-    const built: PersonNode[] = rows.map((r, i) => {
-      const name = String(pick(r, COL.name) || "").trim();
-      const emailRaw = String(pick(r, COL.email) || "").trim();
-      const mgrEmailRaw = String(pick(r, COL.mgrEmail) || "").trim();
+  // Build base PEOPLE nodes from rows (real hierarchy)
+  const peopleNodes: NodeT[] = useMemo(() => {
+    const built = rows.map((r, i) => {
+      const workEmail = String(r["Work Email"] || "").trim();
+      const name = String(r.Name || "").trim();
 
-      const team = String(pick(r, COL.team) || "").trim();
-      const location = String(pick(r, COL.location) || "").trim();
+      const id = workEmail
+        ? normalizeEmail(workEmail)
+        : `name:${name.toLowerCase()}:${i}`;
 
-      // IMPORTANT: pod only from Pod column (not team/title)
-      const pod = String(pick(r, COL.pod) || "").trim() || "No Pod";
-
-      const photoUrl =
-        ensureHttps(String(pick(r, COL.photo) || "")) ||
-        `https://ui-avatars.com/api/?background=eee&color=555&name=${encodeURIComponent(
-          name || "User"
-        )}`;
-
-      const id = emailRaw
-        ? normalizeEmail(emailRaw)
-        : `name:${(name || "unknown").toLowerCase()}:${i}`;
+      const pod = (r.Pod || "").trim() || "No Pod";
 
       return {
         id,
-        parentId: mgrEmailRaw ? normalizeEmail(mgrEmailRaw) : null,
-        name: name || emailRaw || "(no name)",
-        email: emailRaw,
-        team,
-        location,
+        parentId: normalizeEmail(r["Manager Email"]) || null,
+        name: name || workEmail || "(no name)",
+        email: workEmail,
+        team: String(r.Team || "").trim(),
+        location: String(r.Location || "").trim(),
         pod,
-        photoUrl,
-        isPod: false,
+        photoUrl:
+          ensureHttps(r["Photo URL"] || "") ||
+          `https://ui-avatars.com/api/?background=eee&color=555&name=${encodeURIComponent(
+            name || "User"
+          )}`,
       };
     });
 
-    // if managerId not found, make root
+    // If manager id is not present in data, treat as root
     const ids = new Set(built.map((n) => n.id));
     return built.map((n) => ({
       ...n,
@@ -141,108 +176,60 @@ export default function Page() {
     }));
   }, [rows]);
 
-  // --- counts for pod label on expand button ---
-  const podCounts = useMemo(() => {
-    const m = new Map<string, number>();
-    for (const p of personNodes) {
-      const key = p.pod || "No Pod";
-      m.set(key, (m.get(key) || 0) + 1);
-    }
-    return m;
-  }, [personNodes]);
+  // Find CEO/top root if exists (single top). If multiple roots, we keep them as-is.
+  const ceoId: string | null = useMemo(() => {
+    const roots = peopleNodes.filter((n) => n.parentId === null);
+    if (!roots.length) return null;
+    // Prefer a root whose title/team might be CEO; otherwise first root
+    const byEmail = roots.find((r) => r.email && r.email.includes("@"));
+    return (byEmail || roots[0]).id;
+  }, [peopleNodes]);
 
-  // POD view transform:
-  // Create pod nodes under the top root (Parth),
-  // then attach the "top-of-pod" people to pod node,
-  // while keeping manager chains inside same pod intact.
-  const podViewNodes: AnyNode[] = useMemo(() => {
-    if (!personNodes.length) return [];
+  /** POD VIEW nodes:
+   * - Create one pod node under CEO (if CEO exists), else as its own root.
+   * - Inside pod: preserve hierarchy when manager is in same pod.
+   * - If manager is outside pod (or null), attach to pod node.
+   */
+  const podNodes: NodeT[] = useMemo(() => {
+    if (!peopleNodes.length) return [];
 
-    const roots = personNodes.filter((p) => p.parentId === null);
-    const topRoot = roots[0] || personNodes[0];
+    const peopleById = new Map(peopleNodes.map((p) => [p.id, p]));
+    const pods = Array.from(new Set(peopleNodes.map((p) => p.pod || "No Pod")));
 
-    // pod nodes
-    const uniquePods = Array.from(
-      new Set(personNodes.map((p) => p.pod || "No Pod"))
-    ).sort((a, b) => a.localeCompare(b));
-
-    const podNodes: PodNode[] = uniquePods.map((pod) => ({
+    // Create pod header nodes
+    const podHeaderNodes: NodeT[] = pods.map((pod) => ({
       id: `pod:${pod}`,
-      parentId: topRoot.id,
+      parentId: ceoId ? ceoId : null,
       name: pod,
-      podKey: pod,
+      email: "",
+      team: "",
+      location: "",
+      photoUrl: "",
+      pod,
       isPod: true,
-      _expanded: false, // start collapsed
     }));
 
-    const idToPerson = new Map(personNodes.map((p) => [p.id, p]));
-    const personIdToPodNodeId = (pod: string) => `pod:${pod || "No Pod"}`;
+    const adjustedPeople: NodeT[] = peopleNodes.map((p) => {
+      // keep CEO at top (do not re-parent under pod)
+      if (ceoId && p.id === ceoId) return p;
 
-    const transformedPeople: PersonNode[] = personNodes.map((p) => {
-      const myPod = p.pod || "No Pod";
-      const mgr = p.parentId ? idToPerson.get(p.parentId) : null;
+      const manager = p.parentId ? peopleById.get(p.parentId) : null;
+      const samePod = manager && manager.pod === p.pod;
 
-      // If no manager -> keep root as-is (Parth stays on top)
-      if (!p.parentId) return p;
-
-      // If manager exists AND manager is in SAME pod -> keep hierarchy link
-      if (mgr && (mgr.pod || "No Pod") === myPod) {
-        return p;
-      }
-
-      // Otherwise, attach this person under its pod node (top-of-pod)
       return {
         ...p,
-        parentId: personIdToPodNodeId(myPod),
+        parentId: samePod ? p.parentId : `pod:${p.pod || "No Pod"}`,
       };
     });
 
-    // Ensure pod nodes exist even if topRoot itself has some pod
-    // (topRoot stays root; pod nodes are under topRoot)
-    return [...transformedPeople, ...podNodes];
-  }, [personNodes]);
+    return [...podHeaderNodes, ...adjustedPeople];
+  }, [peopleNodes, ceoId]);
 
-  // final nodes shown
-  const nodes: AnyNode[] = useMemo(() => {
-    return layout === "pod" ? podViewNodes : personNodes;
-  }, [layout, podViewNodes, personNodes]);
+  // Choose nodes based on view
+  const nodes = view === "pods" ? podNodes : peopleNodes;
 
-  // helper: expand/collapse entire subtree for a node id
-  function setExpandedSubtree(rootId: string, expanded: boolean) {
-    const parentMap = new Map<string, string | null>();
-    for (const n of nodes) parentMap.set(n.id, n.parentId ?? null);
-
-    // build children map
-    const children = new Map<string, string[]>();
-    for (const n of nodes) {
-      const pid = n.parentId ?? null;
-      if (!pid) continue;
-      if (!children.has(pid)) children.set(pid, []);
-      children.get(pid)!.push(n.id);
-    }
-
-    const stack = [rootId];
-    const desc = new Set<string>([rootId]);
-    while (stack.length) {
-      const cur = stack.pop()!;
-      const kids = children.get(cur) || [];
-      for (const k of kids) {
-        if (!desc.has(k)) {
-          desc.add(k);
-          stack.push(k);
-        }
-      }
-    }
-
-    const newData = nodes.map((n) =>
-      desc.has(n.id) ? { ...(n as any), _expanded: expanded } : n
-    );
-
-    const chart = chartObjRef.current;
-    if (chart) {
-      chart.data(newData).render();
-    }
-  }
+  // Precompute descendant counts for buttonContent (fixes "Engineering 4 but 2 nodes")
+  const descCounts = useMemo(() => computeDescCounts(nodes), [nodes]);
 
   // Render chart
   useEffect(() => {
@@ -254,6 +241,7 @@ export default function Page() {
     }
 
     chartRef.current.innerHTML = "";
+
     let cancelled = false;
 
     (async () => {
@@ -262,128 +250,96 @@ export default function Page() {
 
       if (cancelled || !chartRef.current) return;
 
-      // expose a global handler for pod clicks (because nodeContent is HTML string)
-      (window as any).__ocPodClick = (podNodeId: string) => {
-        // toggle: if already expanded -> collapse subtree, else expand subtree
-        // we detect current state by reading node in chart state
-        const st = chartObjRef.current?.getChartState?.();
-        const found = st?.allNodes?.find((x: any) => x.data?.id === podNodeId);
-        const isExpanded = !!found?.data?._expanded;
-
-        setExpandedSubtree(podNodeId, !isExpanded);
-      };
-
-      const LILAC = "#5B2CE6";
-      const LILAC_BG = "#F4F1FF";
-
       const chart = new OrgChart()
         .container(chartRef.current)
         .data(nodes)
-        .nodeWidth(() => (layout === "pod" ? 360 : 340))
-        .nodeHeight((d: any) => (d.data.isPod ? 92 : 120))
-        .childrenMargin(() => 50)
-        .compactMarginBetween(() => 35)
-        .compactMarginPair(() => 80)
-        // customize expand button text: for pod nodes show TOTAL people in pod
+        .nodeWidth(() => (view === "pods" ? 340 : 360))
+        .nodeHeight(() => (view === "pods" ? 90 : 120))
+        .childrenMargin(() => 60)
+        .compactMarginBetween(() => 40)
+        .compactMarginPair(() => 90)
+        // custom button: show descendant count; for pod nodes shows total people in pod
         .buttonContent((d: any) => {
-          const data = d.node.data;
-          if (data?.isPod) {
-            const podName = data.name as string;
-            const total = podCounts.get(podName) || 0;
-            return `<div style="
-              padding:2px 8px;border-radius:8px;
-              border:1px solid rgba(0,0,0,0.12);
-              background:#fff;font-weight:800;font-size:12px;color:#111827;
-            ">${total}</div>`;
+          const id = d?.data?.id as string;
+          const c = descCounts.get(id) || 0;
+          if (!c) return "";
+          return `
+            <div style="
+              background:#fff;border:1px solid rgba(0,0,0,0.12);
+              border-radius:8px;padding:2px 6px;font-weight:800;font-size:12px;
+              color:#111827; box-shadow:0 2px 8px rgba(0,0,0,0.06);
+            ">${c}</div>
+          `;
+        })
+        // clicking a pod: open everything (closest to "pod click => full hierarchy opens")
+        .onNodeClick((d: any) => {
+          if (d?.data?.isPod) {
+            chart.expandAll();
+            chart.fit();
           }
-
-          // default-ish: show hidden descendants count
-          const cnt = d.node.descendants().length - 1;
-          if (cnt <= 0) return "";
-          return `<div style="
-            padding:2px 8px;border-radius:8px;
-            border:1px solid rgba(0,0,0,0.12);
-            background:#fff;font-weight:800;font-size:12px;color:#111827;
-          ">${cnt}</div>`;
         })
         .nodeContent((d: any) => {
-          const p = d.data as AnyNode;
+          const p = d.data as NodeT;
 
-          // POD node (clickable box, no "x people" text)
-          if ((p as any).isPod) {
-            const podId = p.id;
+          // POD HEADER NODE
+          if (p.isPod) {
             return `
-              <div onclick="window.__ocPodClick('${podId}')"
-                style="
-                  cursor:pointer;
-                  width:360px;height:92px;background:${LILAC_BG};
-                  border:1px solid rgba(0,0,0,0.10);
-                  border-radius:18px;box-shadow:0 6px 18px rgba(0,0,0,0.06);
-                  display:flex;align-items:center;justify-content:center;
-                  position:relative; overflow:hidden;
-                ">
+              <div style="
+                width:340px;height:90px;background:${LILAC_BG};
+                border:1px solid rgba(0,0,0,0.10);
+                border-radius:18px;box-shadow:0 6px 18px rgba(0,0,0,0.06);
+                display:flex;align-items:center;justify-content:center;
+                position:relative; overflow:hidden;
+              ">
                 <div style="position:absolute;left:0;top:0;bottom:0;width:6px;background:${LILAC};"></div>
                 <div style="
-                  font-weight:900;font-size:20px;color:#111827;
+                  font-weight:900;font-size:18px;color:#111827;
                   padding:0 16px; text-align:center;
-                  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:340px;
+                  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:320px;
                 ">
-                  ${(p as any).name}
+                  ${p.name}
                 </div>
               </div>
             `;
           }
 
-          // PERSON node
-          const person = p as PersonNode;
-
-          const img = person.photoUrl
-            ? `<img src="${person.photoUrl}" crossorigin="anonymous"
+          // PERSON NODE (lilac theme, 4 lines: name/team/country/email)
+          const img = p.photoUrl
+            ? `<img src="${p.photoUrl}" crossorigin="anonymous"
                  style="width:64px;height:64px;border-radius:16px;object-fit:cover;border:1px solid rgba(0,0,0,0.12)" />`
             : `<div style="width:64px;height:64px;border-radius:16px;background:rgba(0,0,0,0.06);
                  display:flex;align-items:center;justify-content:center;font-weight:900;">
-                 ${String(person.name).trim().slice(0, 1).toUpperCase()}
+                 ${String(p.name).trim().slice(0, 1).toUpperCase()}
                </div>`;
 
-          // NOTE: Pod badge removed from person card (you wanted only 4 lines)
           return `
             <div style="
-              width:340px;height:120px;background:#fff;border:1px solid rgba(0,0,0,0.14);
+              width:360px;height:120px;background:#fff;border:1px solid rgba(0,0,0,0.12);
               border-radius:18px;box-shadow:0 6px 18px rgba(0,0,0,0.06);
-              padding:12px;display:flex;gap:12px;align-items:center;
-              position:relative; overflow:hidden;
+              padding:12px;display:flex;gap:12px;align-items:center;position:relative;
+              overflow:hidden;
             ">
               <div style="position:absolute;left:0;top:0;bottom:0;width:6px;background:${LILAC};"></div>
-
               ${img}
-
               <div style="display:flex;flex-direction:column;gap:6px;min-width:0;flex:1;">
-                <div style="
-                  font-weight:900;font-size:16px;line-height:1.15;color:#111827;
-                  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-                ">
-                  ${person.name}
+                <div style="font-weight:900;font-size:16px;line-height:1.1;color:#111827;
+                  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+                  ${p.name}
                 </div>
 
-                <div style="
-                  font-size:13px;font-weight:800;color:#111827;
-                  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-                ">
-                  ${person.team}
+                <div style="font-size:13px;font-weight:800;color:#111827;
+                  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+                  ${p.team}
                 </div>
 
-                <div style="
-                  font-size:12px;font-weight:800;color:#374151;
-                  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-                ">
-                  ${person.location}
+                <div style="font-size:12px;font-weight:800;color:#374151;
+                  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+                  ${p.location}
                 </div>
 
-                <div style="
-                  font-size:12px;font-weight:800;color:#6B7280;
-                  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-                ">
-                  ${person.email}
+                <div style="font-size:12px;font-weight:800;color:#6B7280;
+                  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+                  ${p.email}
                 </div>
               </div>
             </div>
@@ -392,15 +348,22 @@ export default function Page() {
         .render();
 
       chartObjRef.current = chart;
+
+      // In pods view, default to expanded so "pod click opens all" feels natural
+      if (view === "pods") {
+        chart.expandAll();
+        chart.fit();
+      }
     })();
 
     return () => {
       cancelled = true;
     };
-  }, [nodes, layout, podCounts]);
+  }, [nodes, view, descCounts]);
 
   async function uploadCsvToServer(file: File) {
     setError("");
+
     const pw = prompt("Admin password?");
     if (!pw) return;
 
@@ -420,10 +383,41 @@ export default function Page() {
 
     // Reload from shared source
     const csv = await (await fetch("/api/org")).text();
-    Papa.parse<RawRow>(csv, {
+    Papa.parse<Record<string, any>>(csv, {
       header: true,
       skipEmptyLines: true,
-      complete: (r) => setRows((r.data || []) as RawRow[]),
+      complete: (r) => {
+        const data = (r.data || []).map((raw) => normalizeRow(raw));
+        setRows(data);
+      },
+      error: (err: unknown) =>
+        setError(err instanceof Error ? err.message : String(err)),
+    });
+  }
+
+  function validateCsvLocally(file: File) {
+    setError("");
+    Papa.parse<Record<string, any>>(file, {
+      header: true,
+      skipEmptyLines: true,
+      complete: (res) => {
+        const headers = (res.meta.fields || []) as string[];
+        const missing = requiredColsMissing(headers);
+        if (missing.length) {
+          setError(`Missing required columns: ${missing.join(", ")}`);
+          return;
+        }
+
+        const data = (res.data || []).map((raw, idx) => {
+          const row = normalizeRow(raw);
+          if (!row.Name?.trim()) {
+            throw new Error(`Row ${idx + 2} has empty Name`);
+          }
+          return row;
+        });
+
+        setRows(data);
+      },
       error: (err: unknown) =>
         setError(err instanceof Error ? err.message : String(err)),
     });
@@ -431,11 +425,40 @@ export default function Page() {
 
   return (
     <div style={{ padding: 20, fontFamily: "system-ui, -apple-system, Segoe UI, Roboto" }}>
-      <h1 style={{ fontSize: 26, fontWeight: 900, margin: "0 0 16px 0" }}>
+      <h1 style={{ fontSize: 26, fontWeight: 900, margin: "0 0 12px 0" }}>
         Aspora Organisational Chart
       </h1>
 
       <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 12, flexWrap: "wrap" }}>
+        <button
+          onClick={() => setView("hierarchy")}
+          style={{
+            padding: "8px 12px",
+            borderRadius: 10,
+            border: "1px solid rgba(0,0,0,0.12)",
+            background: view === "hierarchy" ? LILAC_BG : "#fff",
+            fontWeight: 900,
+            color: "#111827",
+          }}
+        >
+          Hierarchy
+        </button>
+        <button
+          onClick={() => setView("pods")}
+          style={{
+            padding: "8px 12px",
+            borderRadius: 10,
+            border: "1px solid rgba(0,0,0,0.12)",
+            background: view === "pods" ? LILAC_BG : "#fff",
+            fontWeight: 900,
+            color: "#111827",
+          }}
+        >
+          Pods
+        </button>
+
+        <div style={{ width: 1, height: 26, background: "rgba(0,0,0,0.12)" }} />
+
         {isEdit && (
           <input
             type="file"
@@ -447,38 +470,13 @@ export default function Page() {
                 setError("Please upload a .csv file.");
                 return;
               }
+              // quick local parse (so you can see immediately)
+              validateCsvLocally(file);
+              // upload shared
               await uploadCsvToServer(file);
             }}
           />
         )}
-
-        <button
-          onClick={() => setLayout("hierarchy")}
-          style={{
-            padding: "8px 12px",
-            borderRadius: 10,
-            border: "1px solid rgba(0,0,0,0.15)",
-            background: layout === "hierarchy" ? "#F4F1FF" : "#fff",
-            fontWeight: 800,
-          }}
-        >
-          Hierarchy
-        </button>
-
-        <button
-          onClick={() => setLayout("pod")}
-          style={{
-            padding: "8px 12px",
-            borderRadius: 10,
-            border: "1px solid rgba(0,0,0,0.15)",
-            background: layout === "pod" ? "#F4F1FF" : "#fff",
-            fontWeight: 800,
-          }}
-        >
-          Pod View
-        </button>
-
-        <span style={{ width: 10 }} />
 
         <button onClick={() => chartObjRef.current?.fit()} style={{ padding: "8px 12px" }}>
           Fit
@@ -492,7 +490,7 @@ export default function Page() {
       </div>
 
       {error ? (
-        <div style={{ color: "#b00020", fontWeight: 800, marginBottom: 12 }}>{error}</div>
+        <div style={{ color: "#b00020", fontWeight: 900, marginBottom: 12 }}>{error}</div>
       ) : null}
 
       <div
@@ -509,9 +507,8 @@ export default function Page() {
       </div>
 
       <div style={{ marginTop: 10, opacity: 0.7, fontSize: 12 }}>
-        CSV columns supported: Name, Work Email, Manager Email, Team, Location, Photo URL, Pod (optional but recommended).
+        CSV headers expected: Name, Work Email, Manager Email, Team, Location, Photo URL (optional: Pod)
       </div>
     </div>
   );
 }
-
