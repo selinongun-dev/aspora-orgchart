@@ -37,7 +37,7 @@ function ensureHttps(url: string) {
   return `https://${u}`;
 }
 
-// CSV header alias (senin dosyada bazen değişiyor)
+// CSV header alias
 function pick(row: RawRow, keys: string[]) {
   for (const k of keys) {
     const v = row[k];
@@ -65,11 +65,29 @@ export default function ClientPage() {
   const [rows, setRows] = useState<RawRow[]>([]);
   const [error, setError] = useState<string>("");
 
-  // edit=1 sadece sende
+  // Read URL params once (edit=1 + optional view=pod|hierarchy)
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     setIsEdit(params.get("edit") === "1");
+
+    const v = params.get("view");
+    if (v === "pod" || v === "hierarchy") setViewMode(v);
   }, []);
+
+  // helper: keep view in URL (nice for sharing) + auto-fit
+  const setTab = (mode: ViewMode) => {
+    setViewMode(mode);
+
+    // keep query param without losing others (like edit=1)
+    const url = new URL(window.location.href);
+    url.searchParams.set("view", mode);
+    window.history.replaceState({}, "", url.toString());
+
+    // fit after React commits + chart renders
+    requestAnimationFrame(() => {
+      chartObjRef.current?.fit?.();
+    });
+  };
 
   // shared CSV load
   useEffect(() => {
@@ -87,11 +105,11 @@ export default function ClientPage() {
         });
       })
       .catch(() => {
-        // ilk kurulumda normal: csv yoksa sessiz geç
+        // first setup: csv may not exist
       });
   }, []);
 
-  // people nodes (her zaman temel kaynak)
+  // people nodes
   const people: PersonNode[] = useMemo(() => {
     return rows
       .filter((r) => Object.keys(r || {}).length > 0)
@@ -103,9 +121,7 @@ export default function ClientPage() {
         const team = String(pick(r, ["Team"])).trim();
         const location = String(pick(r, ["Location", "Country"])).trim();
 
-        // Pod OPSİYONEL: sadece Pod kolonundan
         const pod = String(pick(r, ["Pod"])).trim();
-
         const photo = String(pick(r, ["Photo URL", "Photo Url", "Photo"])).trim();
 
         const id = email ? normalizeEmail(email) : `name:${name.toLowerCase()}:${i}`;
@@ -128,7 +144,7 @@ export default function ClientPage() {
       });
   }, [rows]);
 
-  // manager olmayanları root say (dataset dışı manager varsa da root olsun)
+  // normalize roots
   const normalizedPeople: PersonNode[] = useMemo(() => {
     const ids = new Set(people.map((p) => p.id));
     return people.map((p) => ({
@@ -137,7 +153,7 @@ export default function ClientPage() {
     }));
   }, [people]);
 
-  // pod -> person id list (pod view expand için)
+  // pod -> person ids
   const idsByPod = useMemo(() => {
     const map = new Map<string, string[]>();
     for (const p of normalizedPeople) {
@@ -148,7 +164,7 @@ export default function ClientPage() {
     return map;
   }, [normalizedPeople]);
 
-  // root belirle (1'den fazla root varsa super-root oluştur)
+  // roots -> super-root if needed
   const { rootId, hierarchyNodes } = useMemo(() => {
     const roots = normalizedPeople.filter((p) => p.parentId === null);
     if (roots.length <= 1) {
@@ -165,7 +181,9 @@ export default function ClientPage() {
       team: "",
       location: "",
       pod: "",
-      photoUrl: `https://ui-avatars.com/api/?background=eee&color=555&name=${encodeURIComponent("Aspora")}`,
+      photoUrl: `https://ui-avatars.com/api/?background=eee&color=555&name=${encodeURIComponent(
+        "Aspora"
+      )}`,
     };
 
     const patched = normalizedPeople.map((p) =>
@@ -175,13 +193,11 @@ export default function ClientPage() {
     return { rootId: superRootId, hierarchyNodes: [superRoot, ...patched] as ChartNode[] };
   }, [normalizedPeople]);
 
-  // POD VIEW node set üretimi
+  // POD VIEW dataset (only used when viewMode === "pod")
   const podNodes: ChartNode[] = useMemo(() => {
     if (viewMode !== "pod") return hierarchyNodes;
-
     if (!rootId) return hierarchyNodes;
 
-    // pod node’larını üret (pod boşsa üretme!)
     const pods = Array.from(idsByPod.keys()).sort((a, b) => a.localeCompare(b));
     const podGroupNodes: PodNode[] = pods.map((pod) => ({
       id: `pod:${pod}`,
@@ -190,41 +206,29 @@ export default function ClientPage() {
       name: pod,
     }));
 
-    // hızlı lookup
     const byId = new Map<string, PersonNode>();
     for (const n of hierarchyNodes) {
       if ((n as any).isPod) continue;
       byId.set((n as PersonNode).id, n as PersonNode);
     }
 
-    // Pod view parent rule:
-    // - podu olan kişi:
-    //    - manager yoksa -> pod node altına
-    //    - manager farklı pod / yok -> pod node altına
-    //    - manager aynı pod -> manager’a bağlı kalsın
-    // - podu olmayan: normal hiyerarşi kalsın (No Pod yok!)
-    const patchedPeople: PersonNode[] = (hierarchyNodes as PersonNode[]).filter(
-      (n) => !(n as any).isPod
-    ).map((p) => {
-      if (!p.pod) return p;
+    const patchedPeople: PersonNode[] = (hierarchyNodes as PersonNode[])
+      .filter((n) => !(n as any).isPod)
+      .map((p) => {
+        if (!p.pod) return p;
 
-      const mgr = p.parentId ? byId.get(p.parentId) : null;
-      const mgrPod = mgr?.pod || "";
+        const mgr = p.parentId ? byId.get(p.parentId) : null;
+        const mgrPod = mgr?.pod || "";
 
-      if (!mgr || mgrPod !== p.pod) {
-        return { ...p, parentId: `pod:${p.pod}` };
-      }
-      return p;
-    });
-
-    // root kişinin kendi pod’u varsa bile root’u bozma:
-    // (root CEO, pod node'lar zaten root altında)
-    // root kişi patchedPeople içinde kalıyor.
+        if (!mgr || mgrPod !== p.pod) {
+          return { ...p, parentId: `pod:${p.pod}` };
+        }
+        return p;
+      });
 
     return [...podGroupNodes, ...patchedPeople] as ChartNode[];
   }, [viewMode, hierarchyNodes, idsByPod, rootId]);
 
-  // Upload
   async function uploadCsvToServer(file: File) {
     setError("");
     const pw = prompt("Admin password?");
@@ -253,11 +257,13 @@ export default function ClientPage() {
     });
   }
 
-  // Render chart
+  // Render chart (single container; tabs just change dataset + styling)
   useEffect(() => {
     if (!chartRef.current) return;
 
-    if (!podNodes.length) {
+    const dataToRender = viewMode === "pod" ? podNodes : hierarchyNodes;
+
+    if (!dataToRender.length) {
       chartRef.current.innerHTML = "";
       return;
     }
@@ -277,49 +283,54 @@ export default function ClientPage() {
 
       const chart = new OrgChart()
         .container(chartRef.current)
-        .data(podNodes)
-        .nodeWidth(() => (viewMode === "pod" ? 340 : 320))
+        .data(dataToRender)
+        .nodeWidth((d: any) => {
+          if (viewMode === "pod" && d?.data?.isPod) return 340;
+          return 320;
+        })
         .nodeHeight((d: any) => {
           if (viewMode === "pod" && d?.data?.isPod) return 90;
-          return 120; // person node her zaman 120 kalsın, buton çakışmasın
+          return 120;
         })
         .childrenMargin(() => 50)
         .compactMarginBetween(() => 35)
         .compactMarginPair(() => 80)
         .onNodeClick((d: any) => {
           const data = d?.data as ChartNode;
+          const c = chart as any;
 
-          // Pod node’a tıklayınca: o pod’un altındaki HER ŞEY tek seferde açılsın/kapanılsın
-          if (data?.isPod) {
-            const podName = data.name;
+          const isExpanded = !!d?.data?._expanded;
+          const safeSet = (id: string, val: boolean) => {
+            if (typeof c.setExpanded === "function") c.setExpanded(id, val);
+          };
+
+          // Pod node: toggle whole pod
+          if (viewMode === "pod" && data?.isPod) {
+            const podName = (data as PodNode).name;
             const ids = idsByPod.get(podName) || [];
-            const isExpanded = !!d?.data?._expanded;
 
-            const c = chart as any;
-
-            const safeSet = (id: string, val: boolean) => {
-              if (typeof c.setExpanded === "function") c.setExpanded(id, val);
-            };
-
-            // toggle
             safeSet(data.id, !isExpanded);
 
-            // pod açılıyorsa: pod içindeki herkes expand olsun
             if (!isExpanded) {
               for (const id of ids) safeSet(id, true);
             } else {
-              // pod kapanıyorsa: pod içindeki herkes collapse olsun
               for (const id of ids) safeSet(id, false);
             }
 
-            if (typeof c.render === "function") c.render();
-            if (typeof c.fit === "function") c.fit();
+            c.render?.();
+            c.fit?.();
+            return;
           }
+
+          // Person node: simple toggle
+          safeSet((data as any).id, !isExpanded);
+          c.render?.();
+          c.fit?.();
         })
         .nodeContent((d: any) => {
           const p = d.data as ChartNode;
 
-          // POD NODE (no "x people" text)
+          // POD NODE
           if ((p as any).isPod) {
             const podName = (p as PodNode).name;
             const total = (idsByPod.get(podName) || []).length;
@@ -365,7 +376,6 @@ export default function ClientPage() {
                  ${String(person.name).trim().slice(0, 1).toUpperCase()}
                </div>`;
 
-          // Sadece: Name / Team / Location / Email
           return `
             <div style="
               width:320px;height:120px;background:#fff;border:1px solid rgba(0,0,0,0.12);
@@ -399,19 +409,21 @@ export default function ClientPage() {
 
       chartObjRef.current = chart;
 
-      // Pod view’de ilk açılışta pod’lar kapalı kalsın ama root görünür olsun
+      // initial behavior: in pod view, collapse all but keep root visible
       if (viewMode === "pod" && (chart as any).collapseAll) {
         (chart as any).collapseAll();
         (chart as any).setExpanded?.(rootId, true);
         (chart as any).render?.();
-        (chart as any).fit?.();
       }
+
+      // Always fit after render (this is the “open and fit view” part)
+      (chart as any).fit?.();
     })();
 
     return () => {
       cancelled = true;
     };
-  }, [podNodes, viewMode, idsByPod, rootId]);
+  }, [viewMode, podNodes, hierarchyNodes, idsByPod, rootId]);
 
   function onLocalFileCheck(headers: string[]) {
     const missing = requiredColsMissing(headers);
@@ -422,78 +434,160 @@ export default function ClientPage() {
     return true;
   }
 
+  const TabButton = ({
+    active,
+    children,
+    onClick,
+  }: {
+    active: boolean;
+    children: React.ReactNode;
+    onClick: () => void;
+  }) => (
+    <button
+      onClick={onClick}
+      role="tab"
+      aria-selected={active}
+      style={{
+        padding: "10px 14px",
+        border: "none",
+        background: active ? "#F5F3FF" : "transparent",
+        color: "#111827",
+        fontWeight: 900,
+        cursor: "pointer",
+        outline: "none",
+      }}
+    >
+      {children}
+    </button>
+  );
+
+  const activeBorder = "2px solid #6D28D9";
+
   return (
     <div style={{ padding: 20, fontFamily: "system-ui, -apple-system, Segoe UI, Roboto" }}>
       <h1 style={{ fontSize: 26, fontWeight: 800, margin: "0 0 16px 0" }}>
         Aspora Organisational Chart
       </h1>
 
-      <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 12, flexWrap: "wrap" }}>
-        {isEdit && (
-          <input
-            type="file"
-            accept=".csv"
-            onChange={async (e) => {
-              const file = e.target.files?.[0];
-              if (!file) return;
-              if (!file.name.toLowerCase().endsWith(".csv")) {
-                setError("Please upload a .csv file.");
-                return;
-              }
+      {/* Top bar: upload (if edit) + tabs + controls */}
+      <div
+        style={{
+          display: "flex",
+          gap: 12,
+          alignItems: "center",
+          justifyContent: "space-between",
+          marginBottom: 12,
+          flexWrap: "wrap",
+        }}
+      >
+        <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+          {isEdit && (
+            <input
+              type="file"
+              accept=".csv"
+              onChange={async (e) => {
+                const file = e.target.files?.[0];
+                if (!file) return;
+                if (!file.name.toLowerCase().endsWith(".csv")) {
+                  setError("Please upload a .csv file.");
+                  return;
+                }
 
-              // hızlı header doğrulama
-              const text = await file.text();
-              Papa.parse<RawRow>(text, {
-                header: true,
-                preview: 1,
-                complete: (res) => {
-                  const headers = (res.meta.fields || []) as string[];
-                  if (!onLocalFileCheck(headers)) return;
-                  uploadCsvToServer(file);
-                },
-                error: (err: unknown) => setError(err instanceof Error ? err.message : String(err)),
-              });
+                const text = await file.text();
+                Papa.parse<RawRow>(text, {
+                  header: true,
+                  preview: 1,
+                  complete: (res) => {
+                    const headers = (res.meta.fields || []) as string[];
+                    if (!onLocalFileCheck(headers)) return;
+                    uploadCsvToServer(file);
+                  },
+                  error: (err: unknown) => setError(err instanceof Error ? err.message : String(err)),
+                });
+              }}
+            />
+          )}
+
+          {/* Tabs */}
+          <div
+            role="tablist"
+            style={{
+              display: "inline-flex",
+              border: "1px solid rgba(0,0,0,0.12)",
+              borderRadius: 12,
+              overflow: "hidden",
+              background: "white",
             }}
-          />
-        )}
+          >
+            <div
+              style={{
+                borderRight: "1px solid rgba(0,0,0,0.10)",
+              }}
+            >
+              <TabButton active={viewMode === "hierarchy"} onClick={() => setTab("hierarchy")}>
+                Hierarchy
+              </TabButton>
+              {viewMode === "hierarchy" ? (
+                <div style={{ height: 2, background: "#6D28D9" }} />
+              ) : (
+                <div style={{ height: 2, background: "transparent" }} />
+              )}
+            </div>
 
-        <button
-          onClick={() => setViewMode("hierarchy")}
-          style={{
-            padding: "8px 12px",
-            borderRadius: 10,
-            border: viewMode === "hierarchy" ? "2px solid #6D28D9" : "1px solid rgba(0,0,0,0.12)",
-            background: viewMode === "hierarchy" ? "#F5F3FF" : "white",
-            fontWeight: 800,
-          }}
-        >
-          Hierarchy View
-        </button>
+            <div>
+              <TabButton active={viewMode === "pod"} onClick={() => setTab("pod")}>
+                Pod
+              </TabButton>
+              {viewMode === "pod" ? (
+                <div style={{ height: 2, background: "#6D28D9" }} />
+              ) : (
+                <div style={{ height: 2, background: "transparent" }} />
+              )}
+            </div>
+          </div>
+        </div>
 
-        <button
-          onClick={() => setViewMode("pod")}
-          style={{
-            padding: "8px 12px",
-            borderRadius: 10,
-            border: viewMode === "pod" ? "2px solid #6D28D9" : "1px solid rgba(0,0,0,0.12)",
-            background: viewMode === "pod" ? "#F5F3FF" : "white",
-            fontWeight: 800,
-          }}
-        >
-          Pod View
-        </button>
+        {/* Shared controls */}
+        <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+          <button
+            onClick={() => chartObjRef.current?.fit?.()}
+            style={{
+              padding: "8px 12px",
+              borderRadius: 10,
+              border: "1px solid rgba(0,0,0,0.12)",
+              background: "white",
+              fontWeight: 800,
+            }}
+          >
+            Fit
+          </button>
 
-        <div style={{ width: 12 }} />
+          <button
+            onClick={() => chartObjRef.current?.expandAll?.()}
+            style={{
+              padding: "8px 12px",
+              borderRadius: 10,
+              border: "1px solid rgba(0,0,0,0.12)",
+              background: "white",
+              fontWeight: 800,
+            }}
+          >
+            Expand
+          </button>
 
-        <button onClick={() => chartObjRef.current?.fit()} style={{ padding: "8px 12px" }}>
-          Fit
-        </button>
-        <button onClick={() => chartObjRef.current?.expandAll()} style={{ padding: "8px 12px" }}>
-          Expand
-        </button>
-        <button onClick={() => chartObjRef.current?.collapseAll()} style={{ padding: "8px 12px" }}>
-          Collapse
-        </button>
+          <button
+            onClick={() => chartObjRef.current?.collapseAll?.()}
+            style={{
+              padding: "8px 12px",
+              borderRadius: 10,
+              border: "1px solid rgba(0,0,0,0.12)",
+              background: "white",
+              fontWeight: 800,
+            }}
+          >
+            Collapse
+          </button>
+        </div>
       </div>
 
       {error ? (
@@ -519,3 +613,4 @@ export default function ClientPage() {
     </div>
   );
 }
+
