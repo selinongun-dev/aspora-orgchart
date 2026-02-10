@@ -388,8 +388,7 @@ export default function ClientPage() {
               <div style="margin-left:6px;display:flex;gap:12px;align-items:center;min-width:0;">
                 ${img}
                 <div style="display:flex;flex-direction:column;gap:6px;min-width:0;">
-                - <div style="font-weight:900;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:210px;">
-                + <div style="font-weight:900;font-size:15px;color:#111827;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:210px;">
+                <div style="font-weight:900;font-size:15px;color:#111827;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:210px;">
                     ${person.name}
                   </div>
                   <div style="font-size:12px;font-weight:800;color:#111827;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:210px;">
