@@ -410,14 +410,22 @@ export default function ClientPage() {
       chartObjRef.current = chart;
 
       // initial behavior: in pod view, collapse all but keep root visible
-      if (viewMode === "pod" && (chart as any).collapseAll) {
-        (chart as any).collapseAll();
-        (chart as any).setExpanded?.(rootId, true);
-        (chart as any).render?.();
-      }
+      if (viewMode === "pod") {
+        const c = chart as any;
 
-      // Always fit after render (this is the “open and fit view” part)
-      (chart as any).fit?.();
+        c.collapseAll?.();
+
+        // root’u aç
+        if (rootId) c.setExpanded?.(rootId, true);
+
+        // root altındaki pod node'larını aç
+        for (const pod of idsByPod.keys()) {
+          c.setExpanded?.(`pod:${pod}`, true);
+        }
+
+        c.render?.();
+        c.fit?.();
+      }
     })();
 
     return () => {
