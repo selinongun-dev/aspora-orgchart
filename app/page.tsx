@@ -482,8 +482,6 @@ export default function ClientPage() {
     </button>
   );
 
-  const activeBorder = "2px solid #6D28D9";
-
   return (
     <div style={{ padding: 20, fontFamily: "system-ui, -apple-system, Segoe UI, Roboto" }}>
       <h1 style={{ fontSize: 26, fontWeight: 800, margin: "0 0 16px 0" }}>
@@ -546,7 +544,7 @@ export default function ClientPage() {
               }}
             >
               <TabButton active={viewMode === "hierarchy"} onClick={() => setTab("hierarchy")}>
-                Hierarchy
+                Team
               </TabButton>
               {viewMode === "hierarchy" ? (
                 <div style={{ height: 2, background: "#6D28D9" }} />
