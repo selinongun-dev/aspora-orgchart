@@ -147,10 +147,23 @@ export default function ClientPage() {
   // normalize roots
   const normalizedPeople: PersonNode[] = useMemo(() => {
     const ids = new Set(people.map((p) => p.id));
-    return people.map((p) => ({
-      ...p,
-      parentId: p.parentId && ids.has(p.parentId) ? p.parentId : null,
-    }));
+    const missing = new Set<string>();
+
+    const result = people.map((p) => {
+      if (p.parentId && !ids.has(p.parentId)) {
+        missing.add(p.parentId);
+      }
+      return {
+        ...p,
+        parentId: p.parentId && ids.has(p.parentId) ? p.parentId : null,
+      };
+    });
+
+    if (missing.size > 0) {
+      console.warn("⚠️ Manager emails not found in CSV:", Array.from(missing));
+    }
+
+    return result;
   }, [people]);
 
   // pod -> person ids
